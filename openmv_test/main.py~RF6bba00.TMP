@@ -1,0 +1,44 @@
+import serial
+import pygame
+import time
+import os
+def serial_audio_player(serial_port='/dev/rfcomm0', baud_rate=115200):
+	pygame.mixer.init()
+	print("音频系统初始化完成")
+	try:
+		ser = serial.Serial(serial_port, baud_rate, timeout=1)
+		print(f"已连接到串口 {serial_port}，波特率 {baud_rate}")
+		time.sleep(2)
+		while True:
+			data = ser.readline().decode('utf-8').strip()
+			if data:
+				try:
+					num = int(data)
+					if 0 <= num <= 256:
+						filename = f"{num}.wav"
+						if os.path.exists(filename):
+							print(f"播放音频: {filename}")
+							if pygame.mixer.music.get_busy():
+								pygame.mixer.music.stop()
+							pygame.mixer.music.load(filename)
+							pygame.mixer.music.play()
+							while pygame.mixer.music.get_busy():
+								time.sleep(0.1)
+						else:
+							print(f"警告: 音频文件 {filename} 不存在")
+					else:
+						print(f"警告: 数值 {num} 超出范围 (0-256)")
+				except ValueError:
+					print(f"警告: 无法将 '{data}' 转换为整数")
+	except serial.SerialException as e:
+		print(f"串口错误: {e}")
+	except Exception as e:
+		print(f"发生错误: {e}")
+	finally:
+		if 'ser' in locals() and ser.is_open:
+			ser.close()
+			print("串口已关闭")
+		pygame.mixer.quit()
+		print("音频系统已关闭")
+while True:
+	serial_audio_player('/dev/rfcomm0', 115200)
