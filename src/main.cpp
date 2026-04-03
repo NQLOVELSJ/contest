@@ -194,61 +194,87 @@ float lastObstacleX = 0;                        // 上一次障碍物X位置
 float lastObstacleY = 0;                        // 上一次障碍物Y位置
 static int openmv=0;
 // 主控端解析函数
+// OpenMV 数据包格式：S,O,x,y,angle,checksumE
+// 其中 checksum = 异或 (XOR) 计算 data 部分（不含S和E）的所有字符
+uint8_t calc_checksum(const char* s) {
+    uint8_t c = 0;
+    while (*s) {
+        c ^= (uint8_t)(*s);
+        s++;
+    }
+    return c;
+}
+
 void read_openmv_data() {
-    static String buffer;
-    static uint32_t lastOpenMVTime = 0;   
-    while (OpenMVSerial.available() > 0) {
-        char c = OpenMVSerial.read();       
-        if (c == '\n') {
-            int parts[3]; // 只需要3个逗号位置
-            parts[0] = buffer.indexOf(',');
-            parts[1] = buffer.indexOf(',', parts[0] + 1);
-            parts[2] = buffer.indexOf(',', parts[1] + 1);
-            int endMarker = buffer.indexOf('E');          
-            // 更健壮的验证
-            if (parts[0] > 0 && parts[1] > parts[0] && 
-                parts[2] > parts[1] && endMarker > parts[2] &&
-                (endMarker - parts[2]) < 10) { // 确保角度部分不会太长               
-                char status = buffer[0];
-                float x = buffer.substring(parts[0] + 1, parts[1]).toFloat();
-                float y = buffer.substring(parts[1] + 1, parts[2]).toFloat();
-                float angle = buffer.substring(parts[2] + 1, endMarker).toFloat();
-                Serial.printf("接收到OpenMV信息!: status=%c, X=%.1f, Y=%.1f, angle=%.1f\n", 
-                                 status, x, y, angle);
-                // 验证数据范围
-                if (x >= 0 && x <= 240 && y >= 0 && y <= 240 && 
-                    angle >= 10 && angle <= 210) {                   
-                    openmvData.status = status;
-                    openmvData.x_pixel = x;
-                    openmvData.y_pixel = y;
-                    openmvData.servo_angle = angle;
-                    openmvData.valid = true;                   
-                    Serial.printf("接收到OpenMV信息!: status=%c, X=%.1f, Y=%.1f, angle=%.1f\n", 
-                                 status, x, y, angle);
-                      openmv=1;           
+    static char buffer[64];
+    static uint8_t bufIndex = 0;
+    static uint32_t lastOpenMVTime = 0;
+    static bool inPacket = false;
+
+    while (OpenMVSerial.available() > 0 && bufIndex < sizeof(buffer) - 1) {
+        char c = OpenMVSerial.read();
+
+        if (c == 'S') {
+            bufIndex = 0;
+            buffer[bufIndex++] = c;
+            inPacket = true;
+            continue;
+        }
+
+        if (!inPacket) {
+            continue;
+        }
+
+        buffer[bufIndex++] = c;
+
+        if (c == 'E') {
+            buffer[bufIndex] = '\0';
+            // 插入结束符后解析包
+            // 例:S,O,120,150,90,3AE
+            char status;
+            int read = 0;
+            float x, y, angle;
+            unsigned int checksum;
+            if (sscanf(buffer, "S,%c,%f,%f,%f,%xE", &status, &x, &y, &angle, &checksum) == 5) {
+                // 校验范围
+                if ((status == 'O' || status == 'N') && x >= 0 && x <= 240 && y >= 0 && y <= 240 && angle >= 10 && angle <= 210) {
+                    // 计算校验和
+                    // 解析 data 字符串（不含头S与尾E以及校验字段）
+                    char dataPart[48] = {0};
+                    int copyLen = snprintf(dataPart, sizeof(dataPart), "%c,%.1f,%.1f,%.1f", status, x, y, angle);
+                    // 兼容整数类型格式
+                    // 计算异或校验
+                    uint8_t calc = 0;
+                    for (int i = 0; i < copyLen; i++) {
+                        calc ^= (uint8_t)dataPart[i];
+                    }
+                    if (calc == (uint8_t)checksum) {
+                        openmvData.status = status;
+                        openmvData.x_pixel = x;
+                        openmvData.y_pixel = y;
+                        openmvData.servo_angle = angle;
+                        openmvData.valid = true;
+                        openmv = 1;
+                    }
                 }
             }
-            buffer = "";
+
+            inPacket = false;
+            bufIndex = 0;
             lastOpenMVTime = millis();
-        } 
-        else if (c != '\r') {
-            buffer += c;
         }
-        
-        // 更严格的缓冲区保护
-        if (buffer.length() > 30) {
-            buffer = "";
-            //Serial.println("Buffer overflow, cleared");
+
+        if (bufIndex >= sizeof(buffer) - 1) {
+            // 保护：丢弃过长包
+            inPacket = false;
+            bufIndex = 0;
         }
     }
-    
-    // 超时处理
+
     if (millis() - lastOpenMVTime > OPENMV_TIMEOUT) {
-        if (!buffer.isEmpty()) {
-            //Serial.printf("Timeout, buffer: %s\n", buffer.c_str());
-            buffer = "";
-        }
         openmvData.valid = false;
+        inPacket = false;
+        bufIndex = 0;
     }
 }
 void read() {
@@ -320,7 +346,10 @@ void loop() {
     // 根据距离计算避障因子
     float targetLeftFactor = 1.0f;
     float targetRightFactor = 1.0f;
-    
+    static bool ultrasonic_clear_long = false; // 超声波1米以上时屏蔽摄像头避障
+
+    ultrasonic_clear_long = (HC_distance > 100.0f);
+
     if (HC_distance > 0 && HC_distance < DANGER_ZONE_START) {
         // 计算距离权重 (0-1之间)
         float distanceWeight = 1.0f - _constrain(
@@ -331,10 +360,10 @@ void loop() {
         // 左转避障：左轮适度加速，右轮适度减速
         targetLeftFactor = 1.0f + distanceWeight * (MAX_AVOIDANCE_FACTOR - 1.0f);
         targetRightFactor = 1.0f - distanceWeight * (1.0f - MIN_AVOIDANCE_FACTOR);
-        HC_first= false; // 避障已触发
-        //Serial.printf("紧急避障启动!|距离%.2f |权重%.2f |左轮速度因子%.2f|右轮速度因子%.2f\n",
-        //             HC_distance, distanceWeight, targetLeftFactor, targetRightFactor);
-    }else if(HC_distance!=0){HC_first = true;}//如果HC-SR04传感器的距离大于危险区开始距离，则不触发紧急避障
+        HC_first = false; // 紧急避障已触发
+    } else if (HC_distance != 0) {
+        HC_first = true;
+    }
     
     // 平滑过渡避障因子
     avoidanceFactorLeft = avoidanceFactorLeft * (1 - AVOIDANCE_SMOOTHING) + 
@@ -356,8 +385,13 @@ void loop() {
     getMotorValue();//获取电机的状态或值
     legControl();//控制机器人的腿部动作
     inverseKinematics();//计算机器人的逆运动学，以确定关节角度
-    if(HC_first)
-    {calculateAvoidanceForces();} // 计算避障力
+    if (!ultrasonic_clear_long && HC_first) {
+        calculateAvoidanceForces(); // 计算避障力
+    } else if (ultrasonic_clear_long) {
+        avoidanceCameraFactorLeft = 1.0f;
+        avoidanceCameraFactorRight = 1.0f;
+        obstacleDetected = false;
+    }
     robotRun();//运行机器人系统
     if (openmv==1){
         Serial.printf(" HC_distance: %f \n", HC_distance);
