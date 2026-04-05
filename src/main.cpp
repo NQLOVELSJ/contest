@@ -8,6 +8,8 @@
 #include "SF_BLDC.h"
 #include <cmath>
 //tockn
+#include <cstring>   // for strchr
+#include <cstdlib>   // for atof, strtol
 #include <iostream>
 #include "MPU6050_tockn.h"
 #include <NewPing.h>  // 添加NewPing库
@@ -18,9 +20,13 @@
 #define MEASURE_INTERVAL 150  // 测量间隔（毫秒）
 #define PAN_SERVO_OFFSET 140
 unsigned long lastMeasureTime = 0;  // 上次测量时间
-SoftwareSerial OpenMVSerial(47, 48); // TX=GPIO47，RX=GPIO48
+SoftwareSerial OpenMVSerial(45, 48); // TX=GPIO45，RX=GPIO48
 #define OPENMV_SERIAL OpenMVSerial // 定义OpenMV串口
 SF_Servo servos = SF_Servo(Wire); //实例化初始化舵机
+
+
+#define DISABLE_HEADING_RECOVERY 0   // 1=禁用恢复, 0=启用恢复
+
 
 //tockn
 MPU6050 mpu6050(Wire, 0.03, 0.97); //实例化初始化传感器
@@ -31,6 +37,7 @@ SF_BLDC motors = SF_BLDC(Serial2);//实例化初始化电机
 #define TRIGGER_PIN 37
 #define ECHO_PIN 38
 #define MAX_DISTANCE 200 // 最大检测距离，单位：厘米
+const float OBSTACLE_VALID_DIST_MAX = 100.0f;   // 超声波有效最大距离（cm），超过此值视为无实际障碍物
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // 实例化NewPing对象
 #define _constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt))) // 限幅函数
 // 舵机云台控制相关变量
@@ -49,10 +56,10 @@ bool emergencyTurn = false; // 紧急转向标志
 //转向参数
 float avoidanceFactorLeft = 1.0f;
 float avoidanceFactorRight = 1.0f;
-const float MAX_AVOIDANCE_FACTOR = 5.2f;  // 最大加速因子（适度增加）
-const float MIN_AVOIDANCE_FACTOR = 0.07f;   // 最小减速因子（适度减速）
-const float AVOIDANCE_SMOOTHING = 0.08f;   // 平滑系数(0.0-1.0) - 较小的值更平滑
-const float DANGER_ZONE_START = 20.0f;     // 开始避障的距离(cm)
+const float MAX_AVOIDANCE_FACTOR = 2.5f;  // 最大加速因子（适度增加）
+const float MIN_AVOIDANCE_FACTOR = 0.4f;   // 最小减速因子（适度减速）
+const float AVOIDANCE_SMOOTHING = 0.3f;   // 平滑系数(0.0-1.0) - 较小的值更平滑
+const float DANGER_ZONE_START = 30.0f;     // 开始紧急避障的距离(cm)
 const float DANGER_ZONE_END = 10.0f;       // 最大避障强度的距离(cm)
 // 障碍物位置预测变量
 float lastCentryX = 0;
@@ -166,6 +173,27 @@ uint32_t recoveryDuration = 0;        // 恢复持续时间
 float recoveryFactorLeft = 1.0f;      // 恢复过程中左轮的因子
 float recoveryFactorRight = 1.0f;     // 恢复过程中右轮的因子
 
+// ========== 航向恢复相关变量 ==========
+bool isRecoveringHeading = false;       // 是否正在恢复航向
+float deltaK_sum = 0.0f;                // 避障期间 (K1-K2) 的累积和（即左轮系数减右轮系数）
+int obstacleCycleCount = 0;             // 避障经历的周期数（loop次数）
+int recoveryCycleCount = 0;             // 恢复已经进行的周期数
+float targetDeltaK = 0.0f;              // 恢复期间需要保持的 (K1-K2) 目标差值
+
+// 用于处理恢复中断的变量
+float remainingDeltaK = 0.0f;           // 被打断时剩余的未恢复转向量（以 deltaK 积分表示）
+int remainingCycles = 0;                // 被打断时剩余的需要恢复的周期数
+//超声波测量
+unsigned int lastPingTime = 0;
+unsigned int pingDuration = 0;
+bool pingPending = false;
+
+// 避障保持计时器
+uint32_t obstacleActiveUntil = 0;
+bool obstacleActive = false;
+const uint32_t OBSTACLE_HOLD_TIME = 200;   // 保持时间（毫秒）
+#define RECOVERY_FIXED_TIME_MS 1000      // 固定恢复时间（毫秒），可调
+#define ESTIMATED_LOOP_INTERVAL_MS 10    // 估计的主循环周期（毫秒），根据实际调整
 struct OpenMVData {
     char status;      // 状态: 'O'=有障碍物, 'N'=无障碍物
     float x_pixel;    // 障碍物水平像素坐标
@@ -193,90 +221,112 @@ uint32_t escapeStartTime = 0;                   // 逃逸开始时间
 float lastObstacleX = 0;                        // 上一次障碍物X位置
 float lastObstacleY = 0;                        // 上一次障碍物Y位置
 static int openmv=0;
-// 主控端解析函数
-// OpenMV 数据包格式：S,O,x,y,angle,checksumE
-// 其中 checksum = 异或 (XOR) 计算 data 部分（不含S和E）的所有字符
-uint8_t calc_checksum(const char* s) {
-    uint8_t c = 0;
-    while (*s) {
-        c ^= (uint8_t)(*s);
-        s++;
-    }
-    return c;
-}
-
 void read_openmv_data() {
     static char buffer[64];
-    static uint8_t bufIndex = 0;
-    static uint32_t lastOpenMVTime = 0;
-    static bool inPacket = false;
+    static uint8_t idx = 0;
+    static bool inFrame = false;
+    static uint32_t lastValidTime = 0;
 
-    while (OpenMVSerial.available() > 0 && bufIndex < sizeof(buffer) - 1) {
-        char c = OpenMVSerial.read();
+    while (OPENMV_SERIAL.available()) {
+        char c = OPENMV_SERIAL.read();
 
-        if (c == 'S') {
-            bufIndex = 0;
-            buffer[bufIndex++] = c;
-            inPacket = true;
-            continue;
-        }
+        // 可选：打印每个字符（调试用）
+        //Serial.printf("%c", c);
 
-        if (!inPacket) {
-            continue;
-        }
-
-        buffer[bufIndex++] = c;
-
-        if (c == 'E') {
-            buffer[bufIndex] = '\0';
-            // 插入结束符后解析包
-            // 例:S,O,120,150,90,3AE
-            char status;
-            int read = 0;
-            float x, y, angle;
-            unsigned int checksum;
-            if (sscanf(buffer, "S,%c,%f,%f,%f,%xE", &status, &x, &y, &angle, &checksum) == 5) {
-                // 校验范围
-                if ((status == 'O' || status == 'N') && x >= 0 && x <= 240 && y >= 0 && y <= 240 && angle >= 10 && angle <= 210) {
-                    // 计算校验和
-                    // 解析 data 字符串（不含头S与尾E以及校验字段）
-                    char dataPart[48] = {0};
-                    int copyLen = snprintf(dataPart, sizeof(dataPart), "%c,%.1f,%.1f,%.1f", status, x, y, angle);
-                    // 兼容整数类型格式
-                    // 计算异或校验
-                    uint8_t calc = 0;
-                    for (int i = 0; i < copyLen; i++) {
-                        calc ^= (uint8_t)dataPart[i];
-                    }
-                    if (calc == (uint8_t)checksum) {
-                        openmvData.status = status;
-                        openmvData.x_pixel = x;
-                        openmvData.y_pixel = y;
-                        openmvData.servo_angle = angle;
-                        openmvData.valid = true;
-                        openmv = 1;
-                    }
-                }
+        if (!inFrame && c == 'S') {
+            inFrame = true;
+            idx = 0;
+            buffer[idx++] = c;
+        } else if (inFrame) {
+            buffer[idx++] = c;
+            if (idx >= sizeof(buffer) - 1) {
+                // 帧过长，丢弃
+                inFrame = false;
+                idx = 0;
+                continue;
             }
+            if (c == 'E') {
+                buffer[idx] = '\0';
+                // 调试：打印完整帧
+                Serial.printf("\nFrame: %s\n", buffer);
 
-            inPacket = false;
-            bufIndex = 0;
-            lastOpenMVTime = millis();
-        }
-
-        if (bufIndex >= sizeof(buffer) - 1) {
-            // 保护：丢弃过长包
-            inPacket = false;
-            bufIndex = 0;
+                // 解析帧：S,O,123,100,150,5AE
+                // 使用 strtok 或手动分割
+                char *token = strtok(buffer, ",");
+                if (token && token[0] == 'S') {
+                    token = strtok(NULL, ","); // status
+                    if (token) {
+                        char status = token[0];
+                        token = strtok(NULL, ","); // x
+                        if (token) {
+                            float x = atof(token);
+                            token = strtok(NULL, ","); // y
+                            if (token) {
+                                float y = atof(token);
+                                token = strtok(NULL, ","); // angle
+                                if (token) {
+                                    float angle = atof(token);
+                                    token = strtok(NULL, ","); // checksum + E
+                                    if (token) {
+                                        // token 形如 "5AE"，最后一位是 E
+                                        int len = strlen(token);
+                                        if (len >= 3 && token[len-1] == 'E') {
+                                            char checksumStr[3] = {token[len-3], token[len-2], '\0'};
+                                            uint8_t recvChecksum = (uint8_t)strtol(checksumStr, NULL, 16);
+                                            // 构建数据部分计算校验和
+                                            char dataPart[32];
+                                            snprintf(dataPart, sizeof(dataPart), "%c,%.0f,%.0f,%.0f",
+                                                     status, x, y, angle);
+                                            uint8_t calcChecksum = 0;
+                                            for (int i = 0; dataPart[i]; i++) {
+                                                calcChecksum ^= (uint8_t)dataPart[i];
+                                            }
+                                            if (calcChecksum == recvChecksum) {
+                                                openmvData.status = status;
+                                                openmvData.x_pixel = x;
+                                                openmvData.y_pixel = y;
+                                                openmvData.servo_angle = angle;
+                                                openmvData.valid = true;
+                                                lastValidTime = millis();
+                                                // 可选打印
+                                                Serial.printf("OK: %c,%.1f,%.1f,%.1f\n", status, x, y, angle);
+                                            } else {
+                                                openmvData.valid = false;
+                                            }
+                                        } else {
+                                            openmvData.valid = false;
+                                        }
+                                    } else {
+                                        openmvData.valid = false;
+                                    }
+                                } else {
+                                    openmvData.valid = false;
+                                }
+                            } else {
+                                openmvData.valid = false;
+                            }
+                        } else {
+                            openmvData.valid = false;
+                        }
+                    } else {
+                        openmvData.valid = false;
+                    }
+                } else {
+                    openmvData.valid = false;
+                }
+                inFrame = false;
+                idx = 0;
+            }
         }
     }
 
-    if (millis() - lastOpenMVTime > OPENMV_TIMEOUT) {
+    if (millis() - lastValidTime > 500) {
         openmvData.valid = false;
-        inPacket = false;
-        bufIndex = 0;
+        inFrame = false;
+        idx = 0;
     }
 }
+
 void read() {
     static String rc_received_chars;
     while (Serial.available() > 0) {
@@ -290,7 +340,6 @@ void read() {
     } 
     
 }
-
 uint8_t cnt;//一个无符号 8 位整数，用于存储计数器的值。
 uint32_t now_time;//一个无符号 32 位整数，用于存储当前时间。
 uint32_t last_time=micros();//一个无符号 32 位整数，用于存储上一次时间。
@@ -298,7 +347,7 @@ static bool HC_first= true; // 用于标记HC-SR04是否触发紧急避障
 //用于初始化机器人系统的各个组件
 void setup() {
     Serial.begin(921600);//波特率设置为 921600
-    OpenMVSerial.begin(115200, SWSERIAL_8N1, 47, 48, false, 256);
+    OpenMVSerial.begin(9600, SWSERIAL_8N1, 45, 48, false, 256);
     // 稳定性优化
     OpenMVSerial.enableIntTx(false); // 禁用发送中断
     OpenMVSerial.setTimeout(10);     // 设置超时
@@ -314,13 +363,14 @@ void setup() {
     sbusRx.Begin(SBUSPIN,-1);
     motors.init();
     motors.setModes(4,4);
-
     delay(6000);
     currTime = micros();
     coordTarget.x = 0;
-    coordTarget.yLeft = ROBOT_LOWESR_FOR_CAL;
-    coordTarget.yRight = ROBOT_LOWESR_FOR_CAL;
-    cnt = ROBOT_LOWESR_FOR_CAL;
+    coordTarget.yLeft = ROBOT_LOWEST_FOR_MOT;  // 设置为最低腿高
+    coordTarget.yRight = ROBOT_LOWEST_FOR_MOT; // 设置为最低腿高
+    cnt = ROBOT_LOWEST_FOR_MOT;                // 设置为最低腿高
+    robotMotion.updown = ROBOT_LOWEST_FOR_MOT; // 设置初始腿高为最低腿高
+    robotMotion.forward = 0;                   // 设置初始前进速度为0
 }
 //主函数，不断循环运行机器人系统,在Arduino环境中，setup() 函数只会运行一次，而 loop() 函数会一直循环运行。
 static float multiplyFactorALL1 = 1.0f;
@@ -331,67 +381,71 @@ void loop() {
     float multiplyFactor2 = 1.0f;
     openmv=0;
     if (millis() - lastMeasureTime > MEASURE_INTERVAL) {
-        lastMeasureTime = millis();
-        unsigned int uS = sonar.ping(); 
-        HC_distance = uS / US_ROUNDTRIP_CM;
-        
-        // 处理无响应情况
-        if (uS == 0) {
-            HC_distance = MAX_DISTANCE;
-        }
-        
-        //Serial.printf("HC-SR04 Distance: %f cm\n", HC_distance);
+    lastMeasureTime = millis();
+    unsigned int uS = sonar.ping(); 
+    HC_distance = uS / US_ROUNDTRIP_CM;         // 单次测量，阻塞约11ms
+    if (HC_distance == 0) HC_distance = MAX_DISTANCE;
     }
+    //Serial.printf("HC-SR04 Distance: %f cm\n", HC_distance);
+    // 根据摄像头数据动态决定转向方向
+    bool turnLeft = true;  // 默认左转
+    if (openmvData.valid && openmvData.status == 'O') {
+    if (openmvData.x_pixel < 100) turnLeft = false;
+    else if (openmvData.x_pixel > 140) turnLeft = true;
+    // 否则保持默认
+    }
+    
     
     // 根据距离计算避障因子
     float targetLeftFactor = 1.0f;
     float targetRightFactor = 1.0f;
-    static bool ultrasonic_clear_long = false; // 超声波1米以上时屏蔽摄像头避障
-
-    ultrasonic_clear_long = (HC_distance > 100.0f);
-
+    
     if (HC_distance > 0 && HC_distance < DANGER_ZONE_START) {
-        // 计算距离权重 (0-1之间)
-        float distanceWeight = 1.0f - _constrain(
-            (HC_distance - DANGER_ZONE_END) / (DANGER_ZONE_START - DANGER_ZONE_END), 
-            0.0f, 1.0f
-        );
-        
-        // 左转避障：左轮适度加速，右轮适度减速
+    float distanceWeight = 1.0f - _constrain(
+        (HC_distance - DANGER_ZONE_END) / (DANGER_ZONE_START - DANGER_ZONE_END), 0.0f, 1.0f);
+    if (turnLeft) {
         targetLeftFactor = 1.0f + distanceWeight * (MAX_AVOIDANCE_FACTOR - 1.0f);
         targetRightFactor = 1.0f - distanceWeight * (1.0f - MIN_AVOIDANCE_FACTOR);
-        HC_first = false; // 紧急避障已触发
-    } else if (HC_distance != 0) {
+    } else {
+        targetLeftFactor = 1.0f - distanceWeight * (1.0f - MIN_AVOIDANCE_FACTOR);
+        targetRightFactor = 1.0f + distanceWeight * (MAX_AVOIDANCE_FACTOR - 1.0f);
+    }
+    HC_first = false;
+    // ===== 新增：清空航向恢复状态 =====
+    isRecoveringHeading = false;
+    deltaK_sum = 0.0f;
+    obstacleCycleCount = 0;
+    recoveryCycleCount = 0;
+    targetDeltaK = 0.0f;
+    remainingDeltaK = 0.0f;
+    remainingCycles = 0;
+    avoidanceCameraFactorLeft = 1.0f;
+    avoidanceCameraFactorRight = 1.0f;
+    // ===== 新增结束 =====
+    } else {
         HC_first = true;
     }
-    
-    // 平滑过渡避障因子
-    avoidanceFactorLeft = avoidanceFactorLeft * (1 - AVOIDANCE_SMOOTHING) + 
-                         targetLeftFactor * AVOIDANCE_SMOOTHING;
-    
-    avoidanceFactorRight = avoidanceFactorRight * (1 - AVOIDANCE_SMOOTHING) + 
-                          targetRightFactor * AVOIDANCE_SMOOTHING;
-    
-    multiplyFactorALL1 = avoidanceFactorRight;
-    multiplyFactorALL2 = avoidanceFactorLeft;
+
+    // 平滑过渡
+    avoidanceFactorLeft = avoidanceFactorLeft * (1 - AVOIDANCE_SMOOTHING) + targetLeftFactor * AVOIDANCE_SMOOTHING;
+    avoidanceFactorRight = avoidanceFactorRight * (1 - AVOIDANCE_SMOOTHING) + targetRightFactor * AVOIDANCE_SMOOTHING;
+
+    // 修正映射：左轮乘左因子，右轮乘右因子
+    multiplyFactorALL1 = avoidanceFactorLeft;
+    multiplyFactorALL2 = avoidanceFactorRight;
     
     
     read_openmv_data();  // 读取OpenMV数据
     updateObstacleData(); // 更新障碍物信息    
-    
+    if(HC_first)
+    {calculateAvoidanceForces();} // 计算避障力
     read();//读取串行端口的数据
     getRCValue();//获取遥控器的值
     getMPUValue();//获取 MPU6050 传感器的数据
     getMotorValue();//获取电机的状态或值
     legControl();//控制机器人的腿部动作
     inverseKinematics();//计算机器人的逆运动学，以确定关节角度
-    if (!ultrasonic_clear_long && HC_first) {
-        calculateAvoidanceForces(); // 计算避障力
-    } else if (ultrasonic_clear_long) {
-        avoidanceCameraFactorLeft = 1.0f;
-        avoidanceCameraFactorRight = 1.0f;
-        obstacleDetected = false;
-    }
+    
     robotRun();//运行机器人系统
     if (openmv==1){
         Serial.printf(" HC_distance: %f \n", HC_distance);
@@ -421,10 +475,10 @@ void setRobotparam(){
     robotMotion.forwardLimit = 15;
     robotMotion.rollLimit = 20;
 
-    robotMode.motorEnable = false;//设置电机使能标志为 false，表示电机未使能。
-    robotMode.servoEnable = false;//设置舵机使能标志为 false，表示舵机未使能。
+    robotMode.motorEnable = true;//设置电机使能标志为 true，表示电机已使能。
+    robotMode.servoEnable = true;//设置舵机使能标志为 true，表示舵机已使能。
     robotMode.printFlag = false;//设置打印标志为 false，表示不打印信息。
-    robotMode.mode = ROBOTMODE_DIABLE;//设置机器人模式为 ROBOTMODE_DIABLE，表示机器人处于禁用状态。
+    robotMode.mode = ROBOTMODE_MOTION;//设置机器人模式为 ROBOTMODE_MOTION，表示机器人处于运动模式。
 
     //电机速度控制方向
     motorStatus.M0Dir = 1;
@@ -436,6 +490,19 @@ void setRobotparam(){
 }
 // 读取遥控器
 void getRCValue(){
+    // 设置默认的遥控器值，确保在遥控器未开启时机器人也能稳定运行
+    static bool firstRun = true;
+    if (firstRun) {
+        // 初始化为中间值
+        RCValue[0] = (RCCHANNEL_MIN + RCCHANNEL_MAX) / 2;  // 转向通道设为中间值
+        RCValue[1] = (RCCHANNEL_MIN + RCCHANNEL_MAX) / 2;  // 前进后退通道设为中间值
+        RCValue[2] = (RCCHANNEL3_MIN + RCCHANNEL3_MAX) / 2; // 腿高通道设为中间值
+        RCValue[3] = (RCCHANNEL_MIN + RCCHANNEL_MAX) / 2;  // 横滚通道设为中间值
+        RCValue[4] = RCCHANNEL3_MIN;  // 使能通道设为最小值（使能状态）
+        RCValue[5] = RCCHANNEL3_MIN;  // 模式通道设为最小值（运动模式）
+        firstRun = false;
+    }
+    
     if(sbusRx.Read()){
         sbusData = sbusRx.ch();
         RCValue[0] = sbusData[0];
@@ -495,47 +562,23 @@ void legControl(){
     float e_H;
     float E_H;
 
-    //根据RC 设定足轮的运动参数
-    robotMotion.turn = map(RCValue[0], RCCHANNEL_MIN, RCCHANNEL_MAX, -1*robotMotion.turnLimit, robotMotion.turnLimit);//转弯，右左右 --- R1
-    robotMotion.forward = map(RCValue[1], RCCHANNEL_MIN, RCCHANNEL_MAX, -1*robotMotion.forwardLimit, robotMotion.forwardLimit);//前进后退，右上下  ----  R0
-    // Serial.printf("%f,%d\n",robotMotion.turn,RCValue[0]);
-    if(robotMotion.forward >= 30) robotMotion.forward = 30;//正数是车身前倾，腿向后
-    else if(robotMotion.forward <= -15) robotMotion.forward = -15;//负数是车身后倾，腿向前
+    // 完全隔离遥控器对转向和前进后退的控制，使用默认值
+    robotMotion.turn = 0;  // 默认不转向
+    robotMotion.forward = 0;  // 默认不前进后退
+    // 遥控器控制已被禁用，机器人将根据避障系统自主行走和避障
 
-    robotMotion.updown = ((int)map(RCValue[2], RCCHANNEL3_MIN, RCCHANNEL3_MAX, robotMotion.lowest, robotMotion.heightest));//变腿高，左上下 --- R2
+    // 禁用遥控器对腿高的控制，始终保持最低腿高
+    robotMotion.updown = ROBOT_LOWEST_FOR_MOT;  // 固定为最低腿高
     robotMotion.roll = map(RCValue[3], RCCHANNEL_MIN, RCCHANNEL_MAX, -1*robotMotion.rollLimit, robotMotion.rollLimit);//横滚，左左右 --- R3
 
-    //根据RC 设定足轮的电机与舵机使能状态
-    if(RCValue[4] == RCCHANNEL3_MIN){
-        robotMode.motorEnable = true;
-        robotMode.servoEnable = true;
-        // Serial.println(111);
-    }else if (RCValue[4] == RCCHANNEL3_MID){
-        // robotMode.motorEnable = true;
-        // robotMode.servoEnable = false;
-        robotMode.motorEnable = false;
-        robotMode.servoEnable = true;
-        // Serial.println(222);
-    }else if (RCValue[4] == RCCHANNEL3_MAX){
-        robotMode.motorEnable = false;
-        robotMode.servoEnable = false;
-        // Serial.println(333);
-    }
+    // 禁用遥控器对电机和舵机使能状态的控制，始终保持使能状态
+    robotMode.motorEnable = true;
+    robotMode.servoEnable = true;
 
-    //根据RC 设定足轮的控制模式
-    if(RCValue[5] == RCCHANNEL3_MIN){
-        robotMode.mode = ROBOTMODE_MOTION;
-        robotMotion.lowest = ROBOT_LOWEST_FOR_MOT;
-        robotMode.printFlag = false;
-    }else if (RCValue[5] == RCCHANNEL3_MID){
-        robotMode.printFlag = true;
-    }else if (RCValue[5] == RCCHANNEL3_MAX){
-        robotMode.mode = ROBOTMODE_CALIBRATION;
-        robotMotion.forward = 0;
-        robotMotion.updown = ROBOT_LOWESR_FOR_CAL;
-        robotMotion.lowest = ROBOT_LOWESR_FOR_CAL;
-        robotMode.printFlag = false;
-    }
+    // 禁用遥控器对控制模式的控制，始终保持ROBOTMODE_MOTION模式
+    robotMode.mode = ROBOTMODE_MOTION;
+    robotMotion.lowest = ROBOT_LOWEST_FOR_MOT;
+    robotMode.printFlag = false;
 
     if(abs(RCValue[2] - RCLastCH3Value) >= 5){
         GyroXPModify = 0.05f;
@@ -549,14 +592,9 @@ void legControl(){
     controlTarget.forward = _constrain(controlTarget.forward, -20, 20);
     // coordTarget.x = coordTarget.x + PID_XCoord.Kp*(controlTarget.forward - coordTarget.x);
 
-    if(robotMode.mode == ROBOTMODE_MOTION && robotMode.servoEnable == true){
-        // e_H = PID_Roll.Kp * LPFRoll((robotMotion.roll - 3) - robotPose.roll);
-        e_H = PID_Roll.Kp * LPFRoll(robotMotion.roll - robotPose.roll);
-        E_H = PID_Gyrox.Kp * (e_H - robotPose.GyroX);
-    }else{
-        e_H = 0;
-        E_H = 0;
-    }
+    // 禁用防侧倾能力
+    e_H = 0;
+    E_H = 0;
     // Serial.printf("%f,%f\n",e_H,E_H);
 
     controlTarget.legLeft = controlTarget.legLeft + PID_Hegiht.Kp * (robotMotion.updown - controlTarget.legLeft);
@@ -781,9 +819,11 @@ void robotRun() {
   // 调试代码
   // controlTarget.velocity = PID_VEL(robotPose.speedAvg);//速度环
 
-  // 初始代码
-  controlTarget.velocity = PID_VEL(robotMotion.forward*0.5f - robotPose.speedAvg);//速度环   forward是遥控器前进后退参数
-  controlTarget.differVel = PID_Streeing.Kp*(robotMotion.turn-robotPose.GyroZ);//转向        turn是遥控器左右控制参数
+  // 自主行走和避障模式
+  // 使用默认速度进行前进，速度环控制
+  float defaultSpeed = 1.0f;  // 默认前进速度，可根据需要调整
+  controlTarget.velocity = PID_VEL(defaultSpeed - robotPose.speedAvg);//速度环，使用默认速度
+  controlTarget.differVel = PID_Streeing.Kp*(robotMotion.turn-robotPose.GyroZ);//转向，robotMotion.turn已设为0
   targetVoltage = PID_Stb.Kp*(controlTarget.velocity + controlTarget.centerAngleOffset - robotPose.pitch) - PID_Stb.Kd * robotPose.GyroY;//直立环 输出控制的电机的目标速度
 
   // 调试代码
@@ -835,214 +875,236 @@ float selfCaliCentroid(float central){
 
 // 4. 核心函数：计算合力并生成控制指令
 void calculateAvoidanceForces() {
-    // 重置避障调整量
-    avoidanceLeftAdjust = 0.0f;
-    avoidanceRightAdjust = 0.0f;
-    // 4.1 更新障碍物速度（如果检测到新数据）
-    if (obstacleDetected && millis() - lastObstacleTime < 1000) {
-        unsigned long currentTime = millis();
-        float dt = (currentTime - currentObstacle.lastUpdateTime) / 1000.0f;
-        
-        if (dt > 0.01f) { // 最小时间间隔10ms
-            currentObstacle.vx = (currentObstacle.x - lastObstacleX) / dt;
-            currentObstacle.vy = (currentObstacle.y - lastObstacleY) / dt;
-            
-            // 保存当前数据用于下次计算
-            lastObstacleX = currentObstacle.x;
-            lastObstacleY = currentObstacle.y;
-            currentObstacle.lastUpdateTime = currentTime;
-        }
+    // ========== 1. 紧急避障（超声波 < 20cm）优先，清空所有恢复状态 ==========
+    if (HC_distance > 0 && HC_distance < DANGER_ZONE_START) {
+        // 清空航向恢复相关
+        isRecoveringHeading = false;
+        deltaK_sum = 0.0f;
+        obstacleCycleCount = 0;
+        remainingDeltaK = 0.0f;
+        remainingCycles = 0;
+        targetDeltaK = 0.0f;
+        recoveryCycleCount = 0;
+        // 紧急避障因子已在 loop 中通过 multiplyFactorALL1/2 应用，摄像头因子设1
+        avoidanceCameraFactorLeft = 1.0f;
+        avoidanceCameraFactorRight = 1.0f;
+        obstacleActive = false;   // 紧急避障时禁用保持机制
+        return;
     }
-    
-    // 4.2 计算目标引力（前进方向）
-    float attractiveForceX = 0.0f;
-    float attractiveForceY = ATTRACTIVE_FORCE_GAIN; // Y轴为前进方向
-    
-    // 4.3 计算障碍物斥力（如果存在障碍物）
-    float repulsiveForceX = 0.0f;
-    float repulsiveForceY = 0.0f;
-    
-    if (obstacleDetected && HC_distance < DANGER_RADIUS) {
-        // 计算障碍物距离
-        float distance = HC_distance; // 优先使用超声波测距
-        
-        // 根据障碍物高度调整避障策略
-            float heightFactor = 1.0f;
-            
-            // 如果障碍物高度低于机器人高度，可以尝试通过
-            if (currentObstacle.z < ROBOT_HEIGHT - 100) {
-                heightFactor = 0.5f; // 减小避让力度
-                //Serial.println("Low obstacle, reduced avoidance");
-            }
-            // 如果障碍物高度高于机器人高度，需要完全避开
-            else if (currentObstacle.z > ROBOT_HEIGHT + 100) {
-                heightFactor = 1.5f; // 增加避让力度
-                //Serial.println("High obstacle, increased avoidance");
-            }
-            
-            // 动态斥力系数
-            float repulsiveGain = REPULSIVE_FORCE_MAX * (1.0f - distance / DANGER_RADIUS) * heightFactor;
-            
-            // 斥力方向（远离障碍物）
-            float dirX = -currentObstacle.x / distance;
-            float dirY = -currentObstacle.y / distance;
-            // 基本斥力
-            repulsiveForceX = dirX * repulsiveGain;
-            repulsiveForceY = dirY * repulsiveGain;
-        
-        // 运动障碍物预测补偿
-        if (fabs(currentObstacle.vx) > 1.0f || fabs(currentObstacle.vy) > 1.0f) {
-            // 预测0.5秒后的位置
-            float predictedX = currentObstacle.x + currentObstacle.vx * 0.5f;
-            float predictedY = currentObstacle.y + currentObstacle.vy * 0.5f;
-            float predictedDistance = sqrt(predictedX * predictedX + predictedY * predictedY);          
-            // 额外斥力补偿
-            if (predictedDistance < DANGER_RADIUS) {
-                float extraRepulsive = 0.5f * repulsiveGain;
-                repulsiveForceX -= (predictedX / predictedDistance) * extraRepulsive;
-                repulsiveForceY -= (predictedY / predictedDistance) * extraRepulsive;
-            }
-        }
+
+    // ========== 2. 检查避障保持是否超时 ==========
+    if (obstacleActive && millis() > obstacleActiveUntil) {
+        obstacleActive = false;   // 保持期结束
+        obstacleDetected = false; 
+        // 注意：不立即清除 deltaK_sum 等，稍后会触发恢复
     }
-    
-    // 4.4 计算合力
-    float totalForceX = attractiveForceX + repulsiveForceX;
-    float totalForceY = attractiveForceY + repulsiveForceY;
-    
-    // 4.5 计算基础前进速度（基于引力）
-    float baseSpeed = ATTRACTIVE_FORCE_GAIN*0.2;
-    
-    // 4.6 根据障碍物位置调整速度和转向
-    float speedAdjust = 1.0f;
-    float turnBias = 0.0f;  // 默认转弯方向（正值为右转，负值为左转）
-    
-    // 如果有障碍物
-    if (obstacleDetected) {
-        // 障碍物在正前方（-10°到+10°范围内）
-        if (fabs(currentObstacle.x) < 0.1f * currentObstacle.y) {
-            // 减速并设置默认左转方向
-            speedAdjust = 0.3f;  // 大幅减速
-            turnBias = -1.0f;    // 默认左转
-        }
-        // 障碍物在左侧（x < 0）
-        else if (currentObstacle.x < 0) {
-            speedAdjust = 0.8f;  // 适度减速
-            turnBias = 1.0f;     // 向右转避开左侧障碍物
-        }
-        // 障碍物在右侧（x > 0）
-        else {
-            speedAdjust = 0.8f;  // 适度减速
-            turnBias = -1.0f;    // 向左转避开右侧障碍物
-        }
-    }
-    
-    // 4.7 计算转向量
-    // 使用合力方向 + 默认转弯偏向
-    float turnAmount = (totalForceX + turnBias) * 0.8f;
-    
-   // 4.8 计算摄像头避障的乘积因子 (范围0.1~3.0)
-    float cameraFactorLeft = 1.0f;
-    float cameraFactorRight = 1.0f;
-    
-    if (obstacleDetected) {
-        // 根据转向量计算乘积因子
-        cameraFactorLeft = 1.0f - turnAmount * 1.0f;
-        cameraFactorRight = 1.0f + turnAmount * 1.0f;
+   // ========== 3. 处理航向恢复模式 ==========
+if (isRecoveringHeading) {
+    // 恢复期间，如果 obstacleActive 变为 true（新障碍物出现），则打断并清空恢复
+    if (obstacleActive) {
+        isRecoveringHeading = false;
+        deltaK_sum = 0.0f;
+        obstacleCycleCount = 0;
+        remainingDeltaK = 0.0f;
+        remainingCycles = 0;
+        targetDeltaK = 0.0f;
+        recoveryCycleCount = 0;
+        avoidanceCameraFactorLeft = 1.0f;
+        avoidanceCameraFactorRight = 1.0f;
+        Serial.println("Recovery interrupted, cleared.");
+        // 注意：不 return，让后续继续执行避障计算（因为此时 obstacleActive=true）
+    } else {
+        // 正常恢复过程
+        float delta = targetDeltaK * 1.2f;   // 可调增益
+        avoidanceCameraFactorLeft = _constrain(1.0f + delta/2.0f, 0.2f, 3.5f);
+        avoidanceCameraFactorRight = _constrain(1.0f - delta/2.0f, 0.2f, 3.5f);
+        recoveryCycleCount++;
         
-        // 限制因子范围
-        cameraFactorLeft = _constrain(cameraFactorLeft, 0.1f, 3.0f);
-        cameraFactorRight = _constrain(cameraFactorRight, 0.1f, 3.0f);
-        
-        // 更新避障因子
-        avoidanceCameraFactorLeft =cameraFactorLeft;
-        avoidanceCameraFactorRight =cameraFactorRight;
-       // Serial.print("avoidanceCameraFactorLeft =\n"); 
-        //Serial.print(avoidanceCameraFactorLeft ); 
-        //Serial.print("avoidanceCameraFactorRight =\n"); 
-        //Serial.print(avoidanceCameraFactorRight ); 
-        // 记录避障开始时间和持续时间
-        if (avoidanceStartTime == 0) {
-            avoidanceStartTime = millis();
-        }
-        avoidanceDuration = millis() - avoidanceStartTime;
-        
-        // 重置恢复状态
-        isRecovering = false;
-    } 
-    else if (!isRecovering && avoidanceStartTime != 0) {
-        // 障碍物消失，开始恢复过程
-        isRecovering = true;
-        recoveryStartTime = millis();
-        recoveryDuration = avoidanceDuration;
-        
-        // 计算恢复因子（避障因子的倒数）
-        recoveryFactorLeft = avoidanceCameraFactorRight;
-        recoveryFactorRight = avoidanceCameraFactorLeft;
-        
-        // 限制恢复因子范围
-        recoveryFactorLeft = _constrain(recoveryFactorLeft, 0.1f, 3.0f);
-        recoveryFactorRight = _constrain(recoveryFactorRight, 0.1f, 3.0f);
-        
-        avoidanceStartTime = 0;
-        
-    }
-    
-    // 4.9 处理恢复过程
-    if (isRecovering) {
-        uint32_t elapsedRecoveryTime = millis() - recoveryStartTime;
-        
-        if (elapsedRecoveryTime < recoveryDuration) {
-            // 应用恢复因子
-            avoidanceCameraFactorLeft = recoveryFactorLeft;
-            avoidanceCameraFactorRight = recoveryFactorRight;
-        } else {
-            // 恢复完成，重置因子
+        int fixedCycles = RECOVERY_FIXED_TIME_MS / ESTIMATED_LOOP_INTERVAL_MS;
+        if (fixedCycles < 1) fixedCycles = 1;
+        if (recoveryCycleCount >= fixedCycles) {
+            // 恢复完成
+            isRecoveringHeading = false;
+            deltaK_sum = 0.0f;
+            obstacleCycleCount = 0;
+            targetDeltaK = 0.0f;
+            remainingDeltaK = 0.0f;
+            remainingCycles = 0;
+            recoveryCycleCount = 0;   // 添加这一行以确保恢复状态完全重置
             avoidanceCameraFactorLeft = 1.0f;
             avoidanceCameraFactorRight = 1.0f;
-            isRecovering = false;
+            Serial.println("Recovery completed.");
+        }
+        return;
+    }
+}
+
+    // ========== 4. 无障碍物且不在恢复中：重置因子，但可能触发恢复 ==========
+    if (!obstacleActive && !isRecoveringHeading) {
+        // 如果之前有累积的转向量（避障刚刚结束），则启动恢复
+        if (obstacleCycleCount > 0 || remainingCycles > 0) {
+            // 合并剩余转向量
+            if (remainingCycles > 0) {
+                deltaK_sum += remainingDeltaK;
+                //obstacleCycleCount += remainingCycles;
+                remainingDeltaK = 0.0f;
+                remainingCycles = 0;
+            }
+            // 启动恢复
+            isRecoveringHeading = true;
+            recoveryCycleCount = 0;
+            // === 新计算方式：基于固定时间 ===
+            int fixedCycles = RECOVERY_FIXED_TIME_MS / ESTIMATED_LOOP_INTERVAL_MS;
+            if (fixedCycles < 1) fixedCycles = 1;
+            targetDeltaK = - (deltaK_sum / fixedCycles);   // 每个循环需要施加的平均差值
+            targetDeltaK = _constrain(targetDeltaK, -2.5f, 2.5f);  // 限制幅度
+            // ===============================
+            
+            // 立即应用一次恢复因子
+            float delta = targetDeltaK * 1.2f;   // 可选增益
+            float leftFactor = 1.0f + delta / 2.0f;
+            float rightFactor = 1.0f - delta / 2.0f;
+            avoidanceCameraFactorLeft = _constrain(leftFactor, 0.2f, 3.5f);
+            avoidanceCameraFactorRight = _constrain(rightFactor, 0.2f, 3.5f);
+            recoveryCycleCount = 1;
+            
+            // 注意：原来记录的 obstacleCycleCount 不再用于控制恢复周期，但保留用于可能的调试
+            // 恢复完成条件也不再基于 recoveryCycleCount >= obstacleCycleCount，而是基于固定周期数
+            return;
+        } else {
+            // 完全无障碍，因子为1
+            avoidanceCameraFactorLeft = 1.0f;
+            avoidanceCameraFactorRight = 1.0f;
+            return;
         }
     }
-    // 4.9 调试输出
-    #ifdef DEBUG_AVOIDANCE
-    Serial.print("AttF(引力):("); 
-    Serial.print(attractiveForceX); 
-    Serial.print(","); 
-    Serial.print(attractiveForceY); 
-    Serial.print(") ");
-    
-    Serial.print("RepF(斥力):("); 
-    Serial.print(repulsiveForceX); 
-    Serial.print(","); 
-    Serial.print(repulsiveForceY); 
-    Serial.print(") ");
-    
-    #endif
+
+    // ========== 5. 有障碍物（obstacleActive == true）：计算避障因子并记录积分 ==========
+    // 使用超声波距离和 currentObstacle 计算转向量
+    float distance = HC_distance;
+    if (distance <= 0 || distance >= DANGER_RADIUS) {
+        // 距离无效，不避障但保持活跃（因子1）
+        avoidanceCameraFactorLeft = 1.0f;
+        avoidanceCameraFactorRight = 1.0f;
+        return;
+    }
+
+    // 势场计算（与之前相同）
+    float heightFactor = 1.0f;
+    if (currentObstacle.z < ROBOT_HEIGHT - 100) heightFactor = 0.5f;
+    else if (currentObstacle.z > ROBOT_HEIGHT + 100) heightFactor = 1.5f;
+
+    float repulsiveGain = REPULSIVE_FORCE_MAX * (1.0f - distance / DANGER_RADIUS) * heightFactor;
+    float dirX = -currentObstacle.x / distance;
+    float dirY = -currentObstacle.y / distance;
+    float repulsiveForceX = dirX * repulsiveGain;
+    float repulsiveForceY = dirY * repulsiveGain;
+
+    float attractiveForceY = ATTRACTIVE_FORCE_GAIN;
+    float totalForceX = repulsiveForceX;
+    float totalForceY = attractiveForceY + repulsiveForceY;
+
+    float turnBias = 0.0f;
+    if (fabs(currentObstacle.x) < 0.1f * currentObstacle.y) {
+        turnBias = -1.0f;
+    } else if (currentObstacle.x < 0) {
+        turnBias = 1.0f;
+    } else {
+        turnBias = -1.0f;
+    }
+    float turnAmount = (totalForceX + turnBias) * 0.8f;
+
+    float cameraLeft = 1.0f - turnAmount * 1.5f;
+    float cameraRight = 1.0f + turnAmount * 1.5f;
+    cameraLeft = _constrain(cameraLeft, 0.1f, 3.0f);
+    cameraRight = _constrain(cameraRight, 0.1f, 3.0f);
+
+    // 低通滤波平滑（可选）
+    static float smoothL = 1.0f, smoothR = 1.0f;
+    float alpha = 0.4f;
+    smoothL = alpha * smoothL + (1.0f - alpha) * cameraLeft;
+    smoothR = alpha * smoothR + (1.0f - alpha) * cameraRight;
+    avoidanceCameraFactorLeft = smoothL;
+    avoidanceCameraFactorRight = smoothR;
+
+    // 记录转向积分（用于航向恢复）
+    float currentDeltaK = avoidanceCameraFactorLeft - avoidanceCameraFactorRight;
+    deltaK_sum += currentDeltaK;
+    obstacleCycleCount++;
 }
-// 修复后的障碍物更新函数
+
+void updateObstacleData_OLD() {
+    // 1. 超声波距离大于100cm时，忽略摄像头数据（但不清除 obstacleActive，让它超时）
+    if (HC_distance > 100.0f) {
+        // 注意：不修改 obstacleActive，保持原状态直到超时
+        return;
+    }
+
+    // 2. 摄像头数据无效时，也不修改 obstacleActive
+    if (!openmvData.valid) {
+        return;
+    }
+
+    // 3. 根据摄像头状态和距离更新障碍物信息
+    if (openmvData.status == 'O') {
+        // 计算障碍物位置（使用超声波距离）
+        float distance = HC_distance;
+        float panAngleRad = radians(openmvData.servo_angle - PAN_SERVO_OFFSET);
+        currentObstacle.x = sin(panAngleRad) * distance;
+        currentObstacle.y = cos(panAngleRad) * distance;
+        float heightRatio = 1.0f - (openmvData.y_pixel / IMAGE_HEIGHT);
+        currentObstacle.z = heightRatio * 100.0f;
+        currentObstacle.lastUpdateTime = millis();
+ 
+        // 激活避障保持
+        obstacleActive = true;
+        obstacleActiveUntil = millis() + OBSTACLE_HOLD_TIME;
+        
+        // 可选：如果正在恢复，打断恢复（恢复会被 calculateAvoidanceForces 处理）
+    } else if (openmvData.status == 'N') {
+        // 无障碍物，不改变 obstacleActive，让计时器自然超时
+        // 但可以记录当前无障信息，用于后续恢复触发
+    }
+}
 void updateObstacleData() {
-    if (!openmvData.valid || openmvData.status != 'O') {
+    // 1. 如果超声波距离本身大于阈值（如100cm），则即使摄像头有数据也不认为有障碍物
+    //    注意：不清除 obstacleActive，让它自然超时（避免刚退出又激活）
+    if (HC_distance > OBSTACLE_VALID_DIST_MAX) {
+        // 可选：如果距离非常远，也可以将 obstacleDetected 置为 false
         obstacleDetected = false;
         return;
     }
-    
-    // 使用超声波测量距离
-    float distance = HC_distance;
-    
-    // 将舵机角度转换为弧度
-    float panAngleRad = radians(openmvData.servo_angle - PAN_SERVO_OFFSET);
-    
-    // 计算世界坐标系中的位置
-    currentObstacle.x = sin(panAngleRad) * distance;
-    currentObstacle.y = cos(panAngleRad) * distance;
-    
-    // 正确的高度计算：图像顶部(y=0)对应更高高度
-    float heightRatio = 1.0f - (openmvData.y_pixel / IMAGE_HEIGHT);
-    currentObstacle.z = heightRatio * 100.0f; 
-    
-    currentObstacle.lastUpdateTime = millis();
-    obstacleDetected = true;
-    
-    /*Serial.printf("Obstacle: X=%.1fcm, Y=%.1fcm, Z=%.1fcm, Angle=%.1f°，左轮速度=%0.1f,右轮速度=%0.1f\n", 
-                 currentObstacle.x, currentObstacle.y, currentObstacle.z,
-                 openmvData.servo_angle, avoidanceLeftAdjust,  avoidanceRightAdjust);*/
+
+    // 2. 摄像头数据无效时，不修改 obstacleActive
+    if (!openmvData.valid) {
+        return;
+    }
+
+    // 3. 根据摄像头状态和超声波距离联合判断
+    if (openmvData.status == 'O') {
+        // 只有当超声波距离有效且在阈值以内时，才激活避障
+        if (HC_distance > 0 && HC_distance < OBSTACLE_VALID_DIST_MAX) {
+            // 计算障碍物位置（使用超声波距离和摄像头角度）
+            float distance = HC_distance;
+            float panAngleRad = radians(openmvData.servo_angle - PAN_SERVO_OFFSET);
+            currentObstacle.x = sin(panAngleRad) * distance;
+            currentObstacle.y = cos(panAngleRad) * distance;
+            float heightRatio = 1.0f - (openmvData.y_pixel / IMAGE_HEIGHT);
+            currentObstacle.z = heightRatio * 100.0f;
+            currentObstacle.lastUpdateTime = millis();
+
+            // 激活避障保持
+            obstacleActive = true;
+            obstacleActiveUntil = millis() + OBSTACLE_HOLD_TIME;
+            obstacleDetected = true;
+        } else {
+            // 摄像头检测到但超声波距离超阈值或无效：视为误识别，不激活避障
+            // 保持 obstacleActive 原状（让它自然超时），但 obstacleDetected 置 false
+            obstacleDetected = false;
+        }
+    } else if (openmvData.status == 'N') {
+        // 摄像头明确报告无障碍物，但超声波可能仍有近距离目标（例如小障碍物未被摄像头识别）
+        // 此时不改变 obstacleActive，让计时器自然超时，避免漏掉纯超声波避障
+        obstacleDetected = false;
+    }
 }
