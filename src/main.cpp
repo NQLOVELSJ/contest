@@ -17,6 +17,12 @@
 #define ROLL_OFFSET 0
 #include <SoftwareSerial.h>
 #include <sys/unistd.h>
+
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <ArduinoJson.h>
+#include "index_html.h"
+
 #define MEASURE_INTERVAL 150  // 测量间隔（毫秒）
 #define PAN_SERVO_OFFSET 140
 unsigned long lastMeasureTime = 0;  // 上次测量时间
@@ -192,8 +198,11 @@ bool pingPending = false;
 uint32_t obstacleActiveUntil = 0;
 bool obstacleActive = false;
 const uint32_t OBSTACLE_HOLD_TIME = 200;   // 保持时间（毫秒）
-#define RECOVERY_FIXED_TIME_MS 1000      // 固定恢复时间（毫秒），可调
-#define ESTIMATED_LOOP_INTERVAL_MS 10    // 估计的主循环周期（毫秒），根据实际调整
+
+// Web服务器和WebSocket对象（全局）
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
 struct OpenMVData {
     char status;      // 状态: 'O'=有障碍物, 'N'=无障碍物
     float x_pixel;    // 障碍物水平像素坐标
@@ -370,7 +379,25 @@ void setup() {
     coordTarget.yRight = ROBOT_LOWEST_FOR_MOT; // 设置为最低腿高
     cnt = ROBOT_LOWEST_FOR_MOT;                // 设置为最低腿高
     robotMotion.updown = ROBOT_LOWEST_FOR_MOT; // 设置初始腿高为最低腿高
-    robotMotion.forward = 0;                   // 设置初始前进速度为0
+    robotMotion.forward = 5.0f;                   // 设置初始前进速度为0
+
+    // --- 添加 WiFi 热点和 Web 服务器初始化 ---
+    const char* ssid = "MyRobot";
+    const char* password = "12345678";
+    WiFi.softAP(ssid, password);
+    Serial.printf("AP started! IP: %s\n", WiFi.softAPIP().toString().c_str());
+
+    // 处理 WebSocket 事件
+    ws.onEvent([](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
+        if(type == WS_EVT_CONNECT) Serial.println("Client connected");
+        else if(type == WS_EVT_DISCONNECT) Serial.println("Client disconnected");
+    });
+    server.addHandler(&ws);
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+    });
+    server.begin();
+
 }
 //主函数，不断循环运行机器人系统,在Arduino环境中，setup() 函数只会运行一次，而 loop() 函数会一直循环运行。
 static float multiplyFactorALL1 = 1.0f;
@@ -447,6 +474,34 @@ void loop() {
     inverseKinematics();//计算机器人的逆运动学，以确定关节角度
     
     robotRun();//运行机器人系统
+    // 广播障碍物信息。
+    static unsigned long lastSend = 0;
+    if (millis() - lastSend > 1000) {
+        lastSend = millis();
+
+        // 构建 JSON 格式的障碍物信息
+        StaticJsonDocument<200> doc;
+        doc["distance"] = HC_distance;
+        doc["status"] = obstacleDetected ? "Obstacle" : "Clear";
+        doc["angle"] = openmvData.servo_angle;
+        doc["x_pixel"] = openmvData.x_pixel;
+        // 可以添加更多数据
+
+        String jsonString;
+        serializeJson(doc, jsonString);
+
+        // 通过 WebSocket 广播给所有连接的客户端（手机网页）
+        ws.textAll(jsonString);
+    }
+    if (obstacleDetected) { // 假设这是你的障碍物标志
+        StaticJsonDocument<200> doc;
+        doc["type"] = "alert";
+        doc["message"] = "obstacle_detected";
+        
+        String jsonString;
+        serializeJson(doc, jsonString);
+        ws.textAll(jsonString);
+    }
     if (openmv==1){
         Serial.printf(" HC_distance: %f \n", HC_distance);
         Serial.printf(" 左轮因子: %f \n", avoidanceCameraFactorRight);
@@ -564,7 +619,7 @@ void legControl(){
 
     // 完全隔离遥控器对转向和前进后退的控制，使用默认值
     robotMotion.turn = 0;  // 默认不转向
-    robotMotion.forward = 0;  // 默认不前进后退
+    robotMotion.forward = 5.0;  // 默认不前进后退
     // 遥控器控制已被禁用，机器人将根据避障系统自主行走和避障
 
     // 禁用遥控器对腿高的控制，始终保持最低腿高
@@ -821,7 +876,7 @@ void robotRun() {
 
   // 自主行走和避障模式
   // 使用默认速度进行前进，速度环控制
-  float defaultSpeed = 1.0f;  // 默认前进速度，可根据需要调整
+  float defaultSpeed = robotMotion.forward;  // 使用 legControl 中设置的默认速度;  
   controlTarget.velocity = PID_VEL(defaultSpeed - robotPose.speedAvg);//速度环，使用默认速度
   controlTarget.differVel = PID_Streeing.Kp*(robotMotion.turn-robotPose.GyroZ);//转向，robotMotion.turn已设为0
   targetVoltage = PID_Stb.Kp*(controlTarget.velocity + controlTarget.centerAngleOffset - robotPose.pitch) - PID_Stb.Kd * robotPose.GyroY;//直立环 输出控制的电机的目标速度
@@ -874,6 +929,207 @@ float selfCaliCentroid(float central){
 }
 
 // 4. 核心函数：计算合力并生成控制指令
+void calculateAvoidanceForces_OLD() {
+// 检查避障保持计时器
+if (obstacleActive && millis() > obstacleActiveUntil) {
+    obstacleActive = false;
+    obstacleDetected = false;   // 同步清除
+        // 可选：恢复默认因子
+    avoidanceCameraFactorLeft = 1.0f;
+    avoidanceCameraFactorRight = 1.0f;
+    // 如果有航向恢复逻辑，也可在此重置
+    }
+
+// 如果不在避障活跃状态，则直接退出（不执行避障计算）
+if (!obstacleActive) {
+    // 确保因子为1
+    avoidanceCameraFactorLeft = 1.0f;
+    avoidanceCameraFactorRight = 1.0f;
+    return;
+    }    
+    
+    // 紧急避障触发时，完全禁用航向恢复逻辑，直接使用紧急因子
+if (HC_distance < DANGER_ZONE_START && HC_distance > 0) {
+    // 清空所有航向恢复状态
+    //isRecoveringHeading = false;
+    //deltaK_sum = 0.0f;
+    //obstacleCycleCount = 0;
+    //remainingDeltaK = 0.0f;
+    //remainingCycles = 0;
+    // 紧急避障因子已在 loop 中通过 multiplyFactorALL1/2 应用，这里摄像头因子设为1
+    //avoidanceCameraFactorLeft = 1.0f;
+    //avoidanceCameraFactorRight = 1.0f;
+    return;
+}
+    #if DISABLE_HEADING_RECOVERY
+    // 完全禁用航向恢复：强制退出恢复模式并清空累积数据
+    isRecoveringHeading = false;
+    deltaK_sum = 0.0f;
+    obstacleCycleCount = 0;
+    recoveryCycleCount = 0;
+    targetDeltaK = 0.0f;
+    remainingDeltaK = 0.0f;
+    remainingCycles = 0;
+    #endif 
+    
+    // 1. 重置摄像头避障因子（默认无避障）
+    float cameraFactorLeft = 1.0f;
+    float cameraFactorRight = 1.0f;
+
+    // 2. 处理航向恢复模式（优先级最高）
+    if (isRecoveringHeading) {
+        // 恢复期间：强制设置左右轮系数差为目标差值
+        // 使用对称分配：左 = 1 + delta/2，右 = 1 - delta/2
+        float delta = targetDeltaK;
+        cameraFactorLeft = 1.0f + delta / 2.0f;
+        cameraFactorRight = 1.0f - delta / 2.0f;
+        
+        // 限制范围，避免差速过大
+        cameraFactorLeft = _constrain(cameraFactorLeft, 0.1f, 3.0f);
+        cameraFactorRight = _constrain(cameraFactorRight, 0.1f, 3.0f);
+        
+        // 更新恢复计数器
+        recoveryCycleCount++;
+        
+        // 恢复完成判断
+        if (recoveryCycleCount >= obstacleCycleCount) {
+            isRecoveringHeading = false;
+            // 重置所有累积变量
+            deltaK_sum = 0.0f;
+            obstacleCycleCount = 0;
+            targetDeltaK = 0.0f;
+            remainingDeltaK = 0.0f;
+            remainingCycles = 0;
+            cameraFactorLeft = 1.0f;
+            cameraFactorRight = 1.0f;
+        }
+        
+        // 更新全局避障因子
+        avoidanceCameraFactorLeft = cameraFactorLeft;
+        avoidanceCameraFactorRight = cameraFactorRight;
+        return;  // 恢复期间不再执行避障计算
+    }
+
+    // 3. 正常避障模式（无恢复进行中）
+    // 首先检查是否有障碍物
+    if (!obstacleDetected) {
+        #if !DISABLE_HEADING_RECOVERY
+        // 无障碍物，但之前可能有过避障（累积数据未清零），启动恢复
+        if (obstacleCycleCount > 0 || remainingCycles > 0) {
+            // 如果有中断剩余的未恢复量，合并到本次累积中
+            if (remainingCycles > 0) {
+                deltaK_sum += remainingDeltaK;
+                obstacleCycleCount += remainingCycles;
+                remainingDeltaK = 0.0f;
+                remainingCycles = 0;
+            }
+            // 启动航向恢复
+            isRecoveringHeading = true;
+            recoveryCycleCount = 0;
+            targetDeltaK = - (deltaK_sum / obstacleCycleCount);
+            // 限制目标差值幅度，防止恢复过猛
+            targetDeltaK = _constrain(targetDeltaK, -1.5f, 1.5f);
+            // 注意：本次调用不设置 cameraFactor，因为恢复模式会在下次循环生效
+            // 但为避免延迟，这里直接调用一次恢复设置
+            cameraFactorLeft = 1.0f + targetDeltaK / 2.0f;
+            cameraFactorRight = 1.0f - targetDeltaK / 2.0f;
+            cameraFactorLeft = _constrain(cameraFactorLeft, 0.1f, 3.0f);
+            cameraFactorRight = _constrain(cameraFactorRight, 0.1f, 3.0f);
+            avoidanceCameraFactorLeft = cameraFactorLeft;
+            avoidanceCameraFactorRight = cameraFactorRight;
+            // 标记恢复状态，下次循环会进入恢复分支
+            isRecoveringHeading = true;
+            recoveryCycleCount = 1; // 本次已算一个周期
+        } else {
+            // 完全无障碍且无累积，恢复默认因子
+            avoidanceCameraFactorLeft = 1.0f;
+            avoidanceCameraFactorRight = 1.0f;
+        }
+        #else
+        // 禁用恢复时，直接重置因子
+        avoidanceCameraFactorLeft = 1.0f;
+        avoidanceCameraFactorRight = 1.0f;
+        #endif
+        return;
+    }
+
+    // 4. 有障碍物且不在恢复模式：执行正常的避障计算
+    // 注意：如果恢复模式被新障碍物打断，会在下面的中断检测中处理
+    if (isRecoveringHeading && obstacleDetected) {
+        // 恢复过程中突然出现障碍物：打断恢复，记录已恢复部分
+        float recoveredDeltaK = targetDeltaK * recoveryCycleCount;
+        remainingDeltaK = deltaK_sum + recoveredDeltaK;  // 未恢复的转向量（deltaK积分剩余）
+        remainingCycles = obstacleCycleCount - recoveryCycleCount;
+        // 退出恢复模式
+        isRecoveringHeading = false;
+        // 继续执行下面的避障计算（不清空 deltaK_sum 等，因为还要累加）
+    }
+
+    // 5. 基于势场的避障因子计算（原有逻辑）
+    float attractiveForceX = 0.0f;
+    float attractiveForceY = ATTRACTIVE_FORCE_GAIN;
+    float repulsiveForceX = 0.0f;
+    float repulsiveForceY = 0.0f;
+    
+    if (HC_distance < DANGER_RADIUS) {
+        float distance = HC_distance;
+        float heightFactor = 1.0f;
+        heightFactor = 1.0f;  // 固定增益，不随高度变化
+        float repulsiveGain = REPULSIVE_FORCE_MAX * (1.0f - distance / DANGER_RADIUS) * heightFactor;
+        float dirX = -currentObstacle.x / distance;
+        float dirY = -currentObstacle.y / distance;
+        repulsiveForceX = dirX * repulsiveGain;
+        repulsiveForceY = dirY * repulsiveGain;
+        
+        // 运动障碍物预测补偿
+        if (fabs(currentObstacle.vx) > 1.0f || fabs(currentObstacle.vy) > 1.0f) {
+            float predictedX = currentObstacle.x + currentObstacle.vx * 0.5f;
+            float predictedY = currentObstacle.y + currentObstacle.vy * 0.5f;
+            float predictedDistance = sqrt(predictedX * predictedX + predictedY * predictedY);
+            if (predictedDistance < DANGER_RADIUS) {
+                float extraRepulsive = 0.5f * repulsiveGain;
+                repulsiveForceX -= (predictedX / predictedDistance) * extraRepulsive;
+                repulsiveForceY -= (predictedY / predictedDistance) * extraRepulsive;
+            }
+        }
+    }
+    
+    float totalForceX = attractiveForceX + repulsiveForceX;
+    float totalForceY = attractiveForceY + repulsiveForceY;
+    
+    float baseSpeed = ATTRACTIVE_FORCE_GAIN * 0.2;
+    float turnBias = 0.0f;
+    if (obstacleDetected) {
+        if (fabs(currentObstacle.x) < 0.2f * currentObstacle.y) {
+            turnBias = -1.0f;
+        } else if (currentObstacle.x < 0) {
+            turnBias = 1.0f;
+        } else {
+            turnBias = -1.0f;
+        }
+    }
+    float turnAmount = (totalForceX + turnBias) * 0.8f;
+    
+    // 根据转向量计算乘积因子
+    float turnScale = 1.5f;  // 可调参数
+    cameraFactorLeft = 1.0f - turnAmount * turnScale;
+    cameraFactorRight = 1.0f + turnAmount * turnScale;
+    cameraFactorLeft = _constrain(cameraFactorLeft, 0.1f, 3.0f);
+    cameraFactorRight = _constrain(cameraFactorRight, 0.1f, 3.0f);
+    
+    // 6. 记录避障期间的 deltaK 累积和周期数（用于航向恢复）
+    float currentDeltaK = cameraFactorLeft - cameraFactorRight;
+    deltaK_sum += currentDeltaK;
+    obstacleCycleCount++;
+    
+    // 7. 更新全局避障因子
+    avoidanceCameraFactorLeft = cameraFactorLeft;
+    avoidanceCameraFactorRight = cameraFactorRight;
+    
+    // 可选：调试输出
+    // Serial.printf("避障: K1=%.2f, K2=%.2f, deltaK=%.2f, sum=%.2f, cnt=%d\n",
+    //               cameraFactorLeft, cameraFactorRight, currentDeltaK, deltaK_sum, obstacleCycleCount);
+}
 void calculateAvoidanceForces() {
     // ========== 1. 紧急避障（超声波 < 20cm）优先，清空所有恢复状态 ==========
     if (HC_distance > 0 && HC_distance < DANGER_ZONE_START) {
@@ -895,49 +1151,43 @@ void calculateAvoidanceForces() {
     // ========== 2. 检查避障保持是否超时 ==========
     if (obstacleActive && millis() > obstacleActiveUntil) {
         obstacleActive = false;   // 保持期结束
-        obstacleDetected = false; 
         // 注意：不立即清除 deltaK_sum 等，稍后会触发恢复
     }
-   // ========== 3. 处理航向恢复模式 ==========
-if (isRecoveringHeading) {
-    // 恢复期间，如果 obstacleActive 变为 true（新障碍物出现），则打断并清空恢复
-    if (obstacleActive) {
-        isRecoveringHeading = false;
-        deltaK_sum = 0.0f;
-        obstacleCycleCount = 0;
-        remainingDeltaK = 0.0f;
-        remainingCycles = 0;
-        targetDeltaK = 0.0f;
-        recoveryCycleCount = 0;
-        avoidanceCameraFactorLeft = 1.0f;
-        avoidanceCameraFactorRight = 1.0f;
-        Serial.println("Recovery interrupted, cleared.");
-        // 注意：不 return，让后续继续执行避障计算（因为此时 obstacleActive=true）
-    } else {
-        // 正常恢复过程
-        float delta = targetDeltaK * 1.2f;   // 可调增益
-        avoidanceCameraFactorLeft = _constrain(1.0f + delta/2.0f, 0.2f, 3.5f);
-        avoidanceCameraFactorRight = _constrain(1.0f - delta/2.0f, 0.2f, 3.5f);
-        recoveryCycleCount++;
-        
-        int fixedCycles = RECOVERY_FIXED_TIME_MS / ESTIMATED_LOOP_INTERVAL_MS;
-        if (fixedCycles < 1) fixedCycles = 1;
-        if (recoveryCycleCount >= fixedCycles) {
-            // 恢复完成
+
+    // ========== 3. 处理航向恢复模式（优先级高于避障） ==========
+    if (isRecoveringHeading) {
+        // 恢复期间，如果 obstacleActive 变为 true（新障碍物出现），则打断恢复
+        if (obstacleActive) {
+            // 记录已恢复的转向量，剩余部分留待下次
+            float recoveredDeltaK = targetDeltaK * recoveryCycleCount;
+            remainingDeltaK = deltaK_sum + recoveredDeltaK;
+            remainingCycles = obstacleCycleCount - recoveryCycleCount;
+            // 退出恢复模式
             isRecoveringHeading = false;
-            deltaK_sum = 0.0f;
-            obstacleCycleCount = 0;
-            targetDeltaK = 0.0f;
-            remainingDeltaK = 0.0f;
-            remainingCycles = 0;
-            recoveryCycleCount = 0;   // 添加这一行以确保恢复状态完全重置
-            avoidanceCameraFactorLeft = 1.0f;
-            avoidanceCameraFactorRight = 1.0f;
-            Serial.println("Recovery completed.");
+            // 注意：不清空 deltaK_sum 和 obstacleCycleCount，继续避障累积
+        } else {
+            // 正常恢复过程
+            float delta = targetDeltaK;
+            float leftFactor = 1.0f + delta / 2.0f;
+            float rightFactor = 1.0f - delta / 2.0f;
+            avoidanceCameraFactorLeft = _constrain(leftFactor, 0.07f, 3.5f);
+            avoidanceCameraFactorRight = _constrain(rightFactor, 0.07f, 3.5f);
+            
+            recoveryCycleCount++;
+            if (recoveryCycleCount >= obstacleCycleCount) {
+                // 恢复完成
+                isRecoveringHeading = false;
+                deltaK_sum = 0.0f;
+                obstacleCycleCount = 0;
+                targetDeltaK = 0.0f;
+                remainingDeltaK = 0.0f;
+                remainingCycles = 0;
+                avoidanceCameraFactorLeft = 1.0f;
+                avoidanceCameraFactorRight = 1.0f;
+            }
+            return;
         }
-        return;
     }
-}
 
     // ========== 4. 无障碍物且不在恢复中：重置因子，但可能触发恢复 ==========
     if (!obstacleActive && !isRecoveringHeading) {
@@ -946,30 +1196,22 @@ if (isRecoveringHeading) {
             // 合并剩余转向量
             if (remainingCycles > 0) {
                 deltaK_sum += remainingDeltaK;
-                //obstacleCycleCount += remainingCycles;
+                obstacleCycleCount += remainingCycles;
                 remainingDeltaK = 0.0f;
                 remainingCycles = 0;
             }
             // 启动恢复
             isRecoveringHeading = true;
             recoveryCycleCount = 0;
-            // === 新计算方式：基于固定时间 ===
-            int fixedCycles = RECOVERY_FIXED_TIME_MS / ESTIMATED_LOOP_INTERVAL_MS;
-            if (fixedCycles < 1) fixedCycles = 1;
-            targetDeltaK = - (deltaK_sum / fixedCycles);   // 每个循环需要施加的平均差值
-            targetDeltaK = _constrain(targetDeltaK, -2.5f, 2.5f);  // 限制幅度
-            // ===============================
-            
-            // 立即应用一次恢复因子
-            float delta = targetDeltaK * 1.2f;   // 可选增益
+            targetDeltaK = - (deltaK_sum / obstacleCycleCount);
+            targetDeltaK = _constrain(targetDeltaK, -1.5f, 1.5f);
+            // 立即应用一次恢复因子（避免延迟）
+            float delta = targetDeltaK;
             float leftFactor = 1.0f + delta / 2.0f;
             float rightFactor = 1.0f - delta / 2.0f;
-            avoidanceCameraFactorLeft = _constrain(leftFactor, 0.2f, 3.5f);
-            avoidanceCameraFactorRight = _constrain(rightFactor, 0.2f, 3.5f);
+            avoidanceCameraFactorLeft = _constrain(leftFactor, 0.3f, 2.0f);
+            avoidanceCameraFactorRight = _constrain(rightFactor, 0.3f, 2.0f);
             recoveryCycleCount = 1;
-            
-            // 注意：原来记录的 obstacleCycleCount 不再用于控制恢复周期，但保留用于可能的调试
-            // 恢复完成条件也不再基于 recoveryCycleCount >= obstacleCycleCount，而是基于固定周期数
             return;
         } else {
             // 完全无障碍，因子为1
