@@ -189,7 +189,7 @@ float targetDeltaK = 0.0f;              // 恢复期间需要保持的 (K1-K2) �
 // 用于处理恢复中断的变量
 float remainingDeltaK = 0.0f;           // 被打断时剩余的未恢复转向量（以 deltaK 积分表示）
 int remainingCycles = 0;                // 被打断时剩余的需要恢复的周期数
-//超声波测量
+// 超声波测量
 unsigned int lastPingTime = 0;
 unsigned int pingDuration = 0;
 bool pingPending = false;
@@ -198,6 +198,16 @@ bool pingPending = false;
 uint32_t obstacleActiveUntil = 0;
 bool obstacleActive = false;
 const uint32_t OBSTACLE_HOLD_TIME = 200;   // 保持时间（毫秒）
+
+// 安全时间比较函数（处理millis()溢出）
+bool timeElapsed(uint32_t startTime, uint32_t interval) {
+    return (millis() - startTime) >= interval;
+}
+
+// 系统状态监控
+const uint32_t RECOVERY_TIMEOUT = 5000;    // 恢复状态超时（5秒）
+const uint32_t LOOP_TIMEOUT_WARNING = 200; // 循环时间警告阈值（200ms）
+uint32_t recoveryStartTime = 0;            // 恢复开始时间
 
 // Web服务器和WebSocket对象（全局）
 AsyncWebServer server(80);
@@ -240,6 +250,9 @@ uint32_t escapeStartTime = 0;                   // 逃逸开始时间
 float lastObstacleX = 0;                        // 上一次障碍物X位置
 float lastObstacleY = 0;                        // 上一次障碍物Y位置
 static int openmv=0;
+
+
+
 void read_openmv_data() {
     static char buffer[64];
     static uint8_t idx = 0;
@@ -413,14 +426,27 @@ void setup() {
 //static float multiplyFactorALL1 = 1.0f;
 //static float multiplyFactorALL2 = 1.0f;
 void loop() {
-    unsigned long currentTime = millis();
+    static unsigned long lastLoopTime = 0;
     float multiplyFactor1 = 1.0f;
     float multiplyFactor2 = 1.0f;
     openmv=0;
+    
+    // ========== 系统监控和看门狗 ==========
+    // 喂狗，防止看门狗复位
+    ESP.wdtFeed();
+    
+    // 监控循环时间
+    uint32_t currentLoopTime = millis();
+    uint32_t loopDuration = currentLoopTime - lastLoopTime;
+    if (loopDuration > LOOP_TIMEOUT_WARNING) {
+        Serial.printf("警告: 循环时间过长: %d ms\n", loopDuration);
+    }
+    lastLoopTime = currentLoopTime;
+    
     // ========== 超声波测距 + 中位数滤波 ==========
     #define MEDIAN_WINDOW 5  // 窗口大小
 
-    if (millis() - lastMeasureTime > MEASURE_INTERVAL) {
+    if (timeElapsed(lastMeasureTime, MEASURE_INTERVAL)) {
         lastMeasureTime = millis();
         
         // 1. 获取原始距离
@@ -458,10 +484,10 @@ void loop() {
         }
 
         // 4. 可选：突变抑制（与中位数滤波二选一，若采用中位数可删除此段）
-        // 中位数已能有效抑制突变，故此处省略或保留均可
+    // 中位数已能有效抑制突变，故此处省略或保留均可
     }
-    Serial.printf("HC-SR04 Distance: %f cm\n", HC_distance);
-    /*if (millis() - lastMeasureTime > MEASURE_INTERVAL) {
+    //Serial.printf("HC-SR04 Distance: %f cm\n", HC_distance);
+    /*if (timeElapsed(lastMeasureTime, MEASURE_INTERVAL)) {
     lastMeasureTime = millis();
     unsigned int uS = sonar.ping();
     Serial.printf("Raw uS: %d ，", uS);
@@ -508,31 +534,26 @@ void loop() {
     robotRun();//运行机器人系统
     // 广播障碍物信息。
     static unsigned long lastSend = 0;
-    if (millis() - lastSend > 1000) {
+    if (timeElapsed(lastSend, 1000)) {
         lastSend = millis();
 
-        // 构建 JSON 格式的障碍物信息
-        StaticJsonDocument<200> doc;
-        doc["distance"] = HC_distance;
-        doc["status"] = obstacleDetected ? "Obstacle" : "Clear";
-        doc["angle"] = openmvData.servo_angle;
-        doc["x_pixel"] = openmvData.x_pixel;
-        // 可以添加更多数据
-
-        String jsonString;
-        serializeJson(doc, jsonString);
+        // 构建 JSON 格式的障碍物信息（使用静态缓冲区）
+        static char jsonBuffer[256];
+        snprintf(jsonBuffer, sizeof(jsonBuffer), 
+                "{\"distance\":%.1f,\"status\":\"%s\",\"angle\":%d,\"x_pixel\":%d}",
+                HC_distance, 
+                obstacleDetected ? "Obstacle" : "Clear",
+                openmvData.servo_angle,
+                openmvData.x_pixel);
 
         // 通过 WebSocket 广播给所有连接的客户端（手机网页）
-        ws.textAll(jsonString);
+        ws.textAll(jsonBuffer);
     }
     if (obstacleDetected) { // 假设这是你的障碍物标志
-        StaticJsonDocument<200> doc;
-        doc["type"] = "alert";
-        doc["message"] = "obstacle_detected";
-        
-        String jsonString;
-        serializeJson(doc, jsonString);
-        ws.textAll(jsonString);
+        static char alertBuffer[128];
+        snprintf(alertBuffer, sizeof(alertBuffer), 
+                "{\"type\":\"alert\",\"message\":\"obstacle_detected\"}");
+        ws.textAll(alertBuffer);
     }
     if (openmv==1){
         Serial.printf(" HC_distance: %f \n", HC_distance);
@@ -541,7 +562,15 @@ void loop() {
         Serial.printf("----------------------------------\n");}
         
     now_time = micros();//获取当前时间
-    float Ts = (now_time - last_time) * 1e-6f;//计算时间间隔
+    // 安全计算时间间隔（处理micros()溢出）
+    float Ts;
+    if (now_time >= last_time) {
+        Ts = (now_time - last_time) * 1e-6f;
+    } else {
+        // 处理micros()溢出
+        Ts = ((uint32_t)(-1) - last_time + now_time) * 1e-6f;
+    }
+    
     if (Ts > 1.0) {
         //这一段代码检查时间间隔是否大于 1 秒。如果是，则更新 last_time 为当前时间 now_time。
         last_time = now_time;
@@ -658,7 +687,7 @@ void legControl(){
             case EM_STOP:
                 robotMotion.forward = 0.0f;          // 停止前进
                 robotMotion.turn = 0.0f;              // 不转向，先停稳
-                if (now - emergencyStateStart > STOP_DURATION) {
+                if (timeElapsed(emergencyStateStart, STOP_DURATION)) {
                     emergencyState = EM_TURN;
                     emergencyStateStart = now;
                 }
@@ -667,7 +696,7 @@ void legControl(){
             case EM_TURN:
                 robotMotion.forward = 0.0f;           // 继续停止
                 robotMotion.turn = emergencyTurnDirection * TURN_SPEED;  // 原地旋转
-                if (now - emergencyStateStart > TURN_DURATION) {
+                if (timeElapsed(emergencyStateStart, TURN_DURATION)) {
                     emergencyState = EM_NONE;          // 紧急避障结束，恢复正常行走
                     // 可选：添加一个短暂直行恢复阶段
                 }
@@ -1216,13 +1245,27 @@ void calculateAvoidanceForces() {
     }
 
     // ========== 2. 检查避障保持是否超时 ==========
-    if (obstacleActive && millis() > obstacleActiveUntil) {
+    if (obstacleActive && timeElapsed(obstacleActiveUntil, 0)) {
         obstacleActive = false;   // 保持期结束
         // 注意：不立即清除 deltaK_sum 等，稍后会触发恢复
     }
 
     // ========== 3. 处理航向恢复模式（优先级高于避障） ==========
     if (isRecoveringHeading) {
+        // 恢复超时保护：如果恢复时间过长，强制退出恢复状态
+        if (timeElapsed(recoveryStartTime, RECOVERY_TIMEOUT)) {
+            isRecoveringHeading = false;
+            deltaK_sum = 0.0f;
+            obstacleCycleCount = 0;
+            targetDeltaK = 0.0f;
+            remainingDeltaK = 0.0f;
+            remainingCycles = 0;
+            avoidanceCameraFactorLeft = 1.0f;
+            avoidanceCameraFactorRight = 1.0f;
+            Serial.println("警告: 航向恢复超时，强制退出");
+            return;
+        }
+        
         // 恢复期间，如果 obstacleActive 变为 true（新障碍物出现），则打断恢复
         if (obstacleActive) {
             // 记录已恢复的转向量，剩余部分留待下次
@@ -1272,6 +1315,8 @@ void calculateAvoidanceForces() {
             recoveryCycleCount = 0;
             targetDeltaK = - (deltaK_sum / obstacleCycleCount);
             targetDeltaK = _constrain(targetDeltaK, -1.5f, 1.5f);
+            // 设置恢复开始时间（用于超时保护）
+            recoveryStartTime = millis();
             // 立即应用一次恢复因子（避免延迟）
             float delta = targetDeltaK;
             float leftFactor = 1.0f + delta / 2.0f;
