@@ -22,6 +22,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include "index_html.h"
+#include "esp_task_wdt.h"  // ESP32看门狗头文件
 
 #define MEASURE_INTERVAL 50  // 测量间隔（毫秒）
 #define PAN_SERVO_OFFSET 140
@@ -207,7 +208,6 @@ bool timeElapsed(uint32_t startTime, uint32_t interval) {
 // 系统状态监控
 const uint32_t RECOVERY_TIMEOUT = 5000;    // 恢复状态超时（5秒）
 const uint32_t LOOP_TIMEOUT_WARNING = 200; // 循环时间警告阈值（200ms）
-uint32_t recoveryStartTime = 0;            // 恢复开始时间
 
 // Web服务器和WebSocket对象（全局）
 AsyncWebServer server(80);
@@ -433,7 +433,7 @@ void loop() {
     
     // ========== 系统监控和看门狗 ==========
     // 喂狗，防止看门狗复位
-    ESP.wdtFeed();
+    esp_task_wdt_reset();  // ESP32正确的看门狗喂狗函数
     
     // 监控循环时间
     uint32_t currentLoopTime = millis();
@@ -678,8 +678,8 @@ void legControl(){
     // ========== 紧急避障状态机（优先级最高） ==========
     static unsigned long turnStartTime = 0;
     const unsigned long STOP_DURATION = 200;   // 停止保持时间（ms）
-    const unsigned long TURN_DURATION = 1000;   // 原地转向时间（ms），可调整为旋转约90度
-    const float TURN_SPEED = 3.0f;             // 转向速度（GyroZ目标值）
+    const unsigned long TURN_DURATION = 3000;   // 原地转向时间（ms），可调整为旋转约90度
+    const float TURN_SPEED = 5.0f;             // 转向速度（GyroZ目标值）
     
     if (emergencyState != EM_NONE) {
         unsigned long now = millis();
