@@ -1,5 +1,16 @@
 #include "SF_Servo.h"
 
+// 引用 main.cpp 中定义的 I2C 失败计数器
+extern uint8_t i2cFailCount;
+
+static void i2cCheckError(uint8_t err) {
+    if (err == 0) {
+        i2cFailCount = 0;  // 成功则清零
+    } else {
+        i2cFailCount++;     // 失败则累加
+    }
+}
+
 SF_Servo::SF_Servo(TwoWire &i2c)
     :  _i2c(&i2c), freq(50){}
 
@@ -96,7 +107,8 @@ void SF_Servo::setPWM(uint8_t num, uint16_t on, uint16_t off){
     _i2c->write(on >> 8);
     _i2c->write(off);
     _i2c->write(off >> 8);
-    _i2c->endTransmission();
+    uint8_t err = _i2c->endTransmission();
+    i2cCheckError(err);
 }
 
 void SF_Servo::setPin(uint8_t num, uint16_t val, bool invert){
@@ -129,13 +141,15 @@ void SF_Servo::writeToPCA(uint8_t addr, uint8_t data){
     _i2c->beginTransmission(PCA9685_ADDR);
     _i2c->write(addr);
     _i2c->write(data);
-    _i2c->endTransmission();
+    uint8_t err = _i2c->endTransmission();
+    i2cCheckError(err);
 }
 
 uint8_t SF_Servo::readFromPCA(uint8_t addr){
     _i2c->beginTransmission(PCA9685_ADDR);
     _i2c->write(addr);
-    _i2c->endTransmission();
+    uint8_t err = _i2c->endTransmission();
+    i2cCheckError(err);
 
     _i2c->requestFrom((uint8_t)PCA9685_ADDR, (uint8_t)1);
     return _i2c->read();
