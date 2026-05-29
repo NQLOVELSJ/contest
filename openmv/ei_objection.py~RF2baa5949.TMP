@@ -1,10 +1,11 @@
 # Edge Impulse - OpenMV FOMO Object Detection Example
-import sensor, image, time, ml, math, uos, gc
+import sensor, image, time, ml, math, uos, gc, binascii
 from pyb import UART, Servo
 
 # 初始化串口
-uart = UART(3, 115200)
-
+uart = UART(3, 38400)
+# 初始化串口（UART(1)对应P1(RX)、P0(TX)）
+uart1 = UART(1, 115200)  # 波特率115200
 # 舵机参数 - 修复安装方向问题
 pan_servo = Servo(1)  # 使用P7引脚（Servo 1）
 PAN_SERVO_OFFSET = 150    # 舵机正前方角度
@@ -15,11 +16,24 @@ target_pan_angle = PAN_SERVO_OFFSET
 
 # 关键修复1：添加方向反转参数
 INVERT_SERVO_DIRECTION = True  # 根据实际安装方向调整
+rx_buf = b''  # 接收缓存，用于拼接不完整的帧数据
+# 帧格式定义
+FRAME_HEADER = b'\xaa'  # 帧头：AA
+FRAME_TAIL = b'\xfb'    # 帧尾：FB
+EXPECTED_FRAME_LEN = 5  # 预期帧长度（AA+数据+FB共5字节）
+VALID_THIRD_BYTE = 0x00  # 第三位有效值（00）
+
+def obstacle_point(x):
+    if x < 120:
+        uart1.write(b'254\r\n')
+    elif 120 < x < 240:
+        uart1.write(b'255\r\n')
+    elif x == 120:
+        uart1.write(b'256\r\n')
 
 # 舵机角度映射函数（处理方向反转）
 def set_servo_angle(angle):
     if INVERT_SERVO_DIRECTION:
-        # 反转方向：逻辑角度0=物理180，逻辑180=物理0
         pan_servo.angle(180 - angle)
     else:
         pan_servo.angle(angle)
@@ -30,37 +44,45 @@ set_servo_angle(PAN_SERVO_OFFSET)
 # 改进的舵机更新函数（添加方向反转）
 def update_servo():
     global current_pan_angle
-    # 计算需要移动的角度差
     angle_diff = target_pan_angle - current_pan_angle
 
-    # 设置最大步长
-    max_step = 5  # 减小步长使运动更平滑
+    max_step = 5
     step = math.copysign(min(abs(angle_diff), max_step), angle_diff)
 
     current_pan_angle += step
     current_pan_angle = max(PAN_SERVO_MIN, min(current_pan_angle, PAN_SERVO_MAX))
 
-    # 应用舵机角度（考虑方向反转）
     set_servo_angle(current_pan_angle)
-    return current_pan_angle  # 返回逻辑角度
+    return current_pan_angle
 
 # 目标角度计算（保持原逻辑）
 def calculate_target_angle(obstacle_x):
-    center_x = 120  # QVGA窗口中心(240/2)
+    center_x = 120
     pixel_offset = obstacle_x - center_x
 
-    # 视场角校准（60度视场角）
-    FOV = 40  # 实际摄像头视场角
+    FOV = 40
     angle_offset = pixel_offset * (FOV / center_x)
 
-    # 右侧障碍物增加角度值
     return PAN_SERVO_OFFSET + angle_offset
+
+# 计算校验和函数 (异或)
+def calculate_checksum(data_str):
+    checksum = 0
+    for c in data_str:
+        checksum ^= ord(c)
+    return checksum
 
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
 sensor.set_framesize(sensor.QVGA)
 sensor.set_windowing((240, 240))
-sensor.skip_frames(time=1000)  # 缩短初始化时间
+sensor.skip_frames(time=2000)
+sensor.set_vflip(True)
+sensor.set_hmirror(True)
+sensor.set_auto_gain(False)
+sensor.set_auto_whitebal(False)
+sensor.set_auto_exposure(False)
+sensor.set_brightness(3)
 
 net = None
 labels = None
@@ -92,7 +114,7 @@ def fomo_post_process(model, inputs, outputs):
 
     l = [[] for _ in range(oc)]
     for i in range(oc):
-        img = image.Image(outputs[0][0, :, :, i] * 255)
+        img = image.Image(outputs[0][0, :, :, i] * 255.0)
         blobs = img.find_blobs(threshold_list, x_stride=1, y_stride=1, area_threshold=1, pixels_threshold=1)
         for b in blobs:
             rect = b.rect()
@@ -106,10 +128,10 @@ def fomo_post_process(model, inputs, outputs):
     return l
 
 # 添加发送频率控制
-OBSTACLE_REPORT_INTERVAL = 50  # 200ms
+OBSTACLE_REPORT_INTERVAL = 80
 last_report_time = 0
-last_obstacle_time = 0  # 记录最后一次检测到障碍物的时间
-OBSTACLE_TIMEOUT = 1000  # 1秒无目标后回中
+last_obstacle_time = 0
+OBSTACLE_TIMEOUT = 1000
 
 clock = time.clock()
 while True:
@@ -120,34 +142,30 @@ while True:
     obstacle_detected = False
     center_x = 0
     center_y = 0
-    highest_score = 0  # 用于选择最高置信度的目标
+    highest_score = 0
 
-    # 1. 物体检测部分
+    # 物体检测部分
     for i, detection_list in enumerate(net.predict([img], callback=fomo_post_process)):
-        if i == 0: continue  # 跳过背景类
+        if i == 0: continue
         if not detection_list: continue
 
         for x, y, w, h, score in detection_list:
             if score < min_confidence:
                 continue
 
-            # 选择置信度最高的目标
             if score > highest_score:
                 highest_score = score
                 center_x = math.floor(x + (w / 2))
                 center_y = math.floor(y + (h / 2))
                 img.draw_circle((center_x, center_y, 12), color=colors[i])
                 obstacle_detected = True
-                last_obstacle_time = current_time  # 更新最后检测时间
+                last_obstacle_time = current_time
 
-    # 2. 舵机控制部分 - 每帧更新
+    # 舵机控制部分
     if obstacle_detected:
-        # 设置目标角度
         target_pan_angle = calculate_target_angle(center_x)
     else:
-        # 检查是否超时无目标
         if time.ticks_diff(current_time, last_obstacle_time) > OBSTACLE_TIMEOUT:
-            # 缓慢回中
             if abs(target_pan_angle - PAN_SERVO_OFFSET) > 1:
                 if target_pan_angle > PAN_SERVO_OFFSET:
                     target_pan_angle -= 1
@@ -156,22 +174,16 @@ while True:
             else:
                 target_pan_angle = PAN_SERVO_OFFSET
 
-    # 更新舵机位置
     current_angle = update_servo()
 
-    # 3. 数据发送部分 - 控制频率
-    if time.ticks_diff(current_time, last_report_time) > OBSTACLE_REPORT_INTERVAL:
-        if obstacle_detected:
-            # 发送检测到的障碍物数据（使用逻辑角度）
-            data = f"O,{center_x},{center_y},{int(current_angle)},E\n"
-            uart.write(data)
-            print(f"发送: {data.strip()}")
-        else:
-            # 发送无障碍物状态
-            data = f"N,0,0,{int(current_angle)},E\n"
-            #uart.write(data)
-            #print(f"发送: {data.strip()}")
-
+    # 数据发送部分 - 只在有障碍物时发送
+    if obstacle_detected and time.ticks_diff(current_time, last_report_time) > OBSTACLE_REPORT_INTERVAL:
+        data_str = f"O,{center_x},{center_y},{int(current_angle)}"
+        checksum = calculate_checksum(data_str)
+        data = f"S,{data_str},{checksum:02X}E"
+        obstacle_point(center_x)
+        uart.write(data.encode())
+        print(f"发送: {data}")
         last_report_time = current_time
 
     print(f"{clock.fps():.1f} fps")

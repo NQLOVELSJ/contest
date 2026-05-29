@@ -1,11 +1,11 @@
 import sensor, image, time, ml, math, uos, gc, binascii
 from pyb import UART, Servo
-uart = UART(3, 115200)
-uart1 = UART(1, 115200)
+uart = UART(3, 9600)
+uart1 = UART(1, 9600)
 pan_servo = Servo(1)
-PAN_SERVO_OFFSET = 140
-PAN_SERVO_MIN = 110
-PAN_SERVO_MAX = 170
+PAN_SERVO_OFFSET = 150
+PAN_SERVO_MIN = 90
+PAN_SERVO_MAX = 210
 current_pan_angle = PAN_SERVO_OFFSET
 target_pan_angle = PAN_SERVO_OFFSET
 INVERT_SERVO_DIRECTION = True
@@ -21,39 +21,6 @@ def obstacle_point(x):
 		uart1.write(b'255\r\n')
 	elif x == 120:
 		uart1.write(b'256\r\n')
-def read_language():
-	global rx_buf
-	if uart1.any():
-		new_data = uart1.read() or b''
-		rx_buf += new_data
-		print(f"接收原始字节: {binascii.hexlify(rx_buf).decode('utf-8')}")
-		while True:
-			header_idx = rx_buf.find(FRAME_HEADER)
-			if header_idx == -1:
-				rx_buf = b''
-				break
-			rx_buf = rx_buf[header_idx:]
-			if len(rx_buf) >= EXPECTED_FRAME_LEN:
-				if rx_buf[-1:] == FRAME_TAIL:
-					frame = rx_buf[:EXPECTED_FRAME_LEN]
-					rx_buf = rx_buf[EXPECTED_FRAME_LEN:]
-					frame_hex = binascii.hexlify(frame).decode('utf-8')
-					print(f"找到完整帧: {frame_hex}")
-					third_byte = frame[2]
-					if third_byte != VALID_THIRD_BYTE:
-						print(f"校验失败：第三位为0x{third_byte:02x}（要求0x00），跳过处理")
-						continue
-					valid_byte = frame[3]
-					print(f"有效位（16进制）: 0x{valid_byte:02x}")
-					mapped_value = valid_byte
-					print(f"映射后的十进制值: {mapped_value}")
-					send_data = f"{mapped_value}\r\n"
-					uart1.write(send_data.encode())
-					print(f"发送的数据: {send_data.strip()}（已添加\\r\\n结尾）")
-				else:
-					rx_buf = rx_buf[1:]
-			else:
-				break
 def set_servo_angle(angle):
 	if INVERT_SERVO_DIRECTION:
 		pan_servo.angle(180 - angle)
@@ -75,12 +42,22 @@ def calculate_target_angle(obstacle_x):
 	FOV = 40
 	angle_offset = pixel_offset * (FOV / center_x)
 	return PAN_SERVO_OFFSET + angle_offset
+def calculate_checksum(data_str):
+	checksum = 0
+	for c in data_str:
+		checksum ^= ord(c)
+	return checksum
 sensor.reset()
-sensor.set_brightness(2)
 sensor.set_pixformat(sensor.RGB565)
 sensor.set_framesize(sensor.QVGA)
 sensor.set_windowing((240, 240))
-sensor.skip_frames(time=1000)
+sensor.skip_frames(time=2000)
+sensor.set_vflip(True)
+sensor.set_hmirror(True)
+sensor.set_auto_gain(False)
+sensor.set_auto_whitebal(False)
+sensor.set_auto_exposure(False)
+sensor.set_brightness(3)
 net = None
 labels = None
 min_confidence = 0.5
@@ -106,7 +83,7 @@ def fomo_post_process(model, inputs, outputs):
 	y_offset = ((inputs[0].roi[3] - (ow * scale)) / 2) + inputs[0].roi[1]
 	l = [[] for _ in range(oc)]
 	for i in range(oc):
-		img = image.Image(outputs[0][0, :, :, i] * 255)
+		img = image.Image(outputs[0][0, :, :, i] * 255.0)
 		blobs = img.find_blobs(threshold_list, x_stride=1, y_stride=1, area_threshold=1, pixels_threshold=1)
 		for b in blobs:
 			rect = b.rect()
@@ -118,10 +95,12 @@ def fomo_post_process(model, inputs, outputs):
 			h = int(h * scale)
 			l[i].append((x, y, w, h, score))
 	return l
-OBSTACLE_REPORT_INTERVAL = 100
+OBSTACLE_REPORT_INTERVAL = 80
 last_report_time = 0
 last_obstacle_time = 0
 OBSTACLE_TIMEOUT = 1000
+SEND_INTERVAL = 100
+last_send_time = 0
 clock = time.clock()
 while True:
 	clock.tick()
@@ -131,11 +110,9 @@ while True:
 	center_x = 0
 	center_y = 0
 	highest_score = 0
-	read_language()
 	for i, detection_list in enumerate(net.predict([img], callback=fomo_post_process)):
 		if i == 0: continue
 		if not detection_list: continue
-		print("********** %s **********" % labels[i])
 		for x, y, w, h, score in detection_list:
 			if score < min_confidence:
 				continue
@@ -152,19 +129,21 @@ while True:
 		if time.ticks_diff(current_time, last_obstacle_time) > OBSTACLE_TIMEOUT:
 			if abs(target_pan_angle - PAN_SERVO_OFFSET) > 1:
 				if target_pan_angle > PAN_SERVO_OFFSET:
-					target_pan_angle -= 1
+					target_pan_angle -= 2
 				else:
-					target_pan_angle += 1
+					target_pan_angle += 2
 			else:
 				target_pan_angle = PAN_SERVO_OFFSET
 	current_angle = update_servo()
-	if time.ticks_diff(current_time, last_report_time) > OBSTACLE_REPORT_INTERVAL:
+	if time.ticks_diff(current_time, last_send_time) >= SEND_INTERVAL:
 		if obstacle_detected:
-			data = f"O,{center_x},{center_y},{int(current_angle)},E\n"
-			obstacle_point(center_x)
-			uart.write(data)
-			print(f"发送: {data.strip()}")
+			status = 'O'
+			data_str = f"{status},{center_x},{center_y},{int(current_angle)}"
 		else:
-			data = f"N,0,0,{int(current_angle)},E\n"
-		last_report_time = current_time
-	print(f"{clock.fps():.1f} fps")
+			status = 'N'
+			data_str = f"{status},0,0,{int(current_angle)}"
+		checksum = calculate_checksum(data_str)
+		frame = f"S,{data_str},{checksum:02X}E"
+		uart1.write(frame.encode())
+		print(frame)
+		last_send_time = current_time

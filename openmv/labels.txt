@@ -1,4 +1,3 @@
 background
 a chair
 column
-hands
